@@ -77,6 +77,7 @@ func init() {
 	if apiKey == "" {
 		panic("need env APIKEY")
 	}
+	pflag.StringVar(&user, "user", "default", "headscale default username")
 	pflag.StringVar(&host, "host", "localhost", "headscale server hostname")
 	pflag.IntVar(&port, "port", 8080, "headscale server port")
 	pflag.StringVar(&config, "config", "/etc/headscale/config.yaml", "headscale config file")
