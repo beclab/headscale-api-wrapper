@@ -2,20 +2,20 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"github.com/gin-gonic/gin"
 	resty "github.com/go-resty/resty/v2"
+	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/pflag"
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"strings"
 	"time"
-	"github.com/mitchellh/mapstructure"
 	//	"strconv"
-	"encoding/json"
 	"bytes"
+	"encoding/json"
 )
 
 const (
@@ -57,7 +57,6 @@ var machinetagsStr string = "/machine/:machineId/tags"
 var routeDisableStr string = "/routes/:routeId/disable"
 var routeEnableStr string = "/routes/:routeId/enable"
 
-
 var apiKey string
 var host string
 var port int
@@ -92,7 +91,7 @@ func ProxyMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		log.Println("ProxyMiddleware")
 		log.Println(c.Request.URL.Path)
-		if c.Request.Method == "GET" && c.Request.URL.Path == proxyPrefix + preauthkeyStr {
+		if c.Request.Method == "GET" && c.Request.URL.Path == proxyPrefix+preauthkeyStr {
 			return
 		}
 		var oreq OnionRequest
@@ -120,8 +119,8 @@ func main() {
 		router := gin.Default()
 		router.SetTrustedProxies(nil)
 
-		router.GET(proxyPrefix + preauthkeyStr, func(c *gin.Context) {
-	
+		router.GET(proxyPrefix+preauthkeyStr, func(c *gin.Context) {
+
 			data := createPreAuthKeyRequest{
 				User:       user,
 				Reusable:   true,
@@ -129,7 +128,7 @@ func main() {
 				Expiration: time.Now().UTC().AddDate(10, 0, 0).Format(time.RFC3339),
 			}
 			fmt.Println(data)
-	
+
 			resp, err := createPreAuthKey(&data, preauthkeyStr)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, response{
@@ -139,24 +138,23 @@ func main() {
 				return
 			}
 			c.JSON(http.StatusOK, response{
-					Code:		0,
-					Message:	"",
-					Data:		resp,
+				Code:    0,
+				Message: "",
+				Data:    resp,
 			})
 		})
 
 		go router.Run(":9000")
 	}
 
-	//	gin.SetMode(gin.ReleaseMode)
+	// gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 	router.SetTrustedProxies(nil)
 
-
 	rgProxy := router.Group(proxyPrefix)
-	rgProxy.Use(ProxyMiddleware())
+	// rgProxy.Use(ProxyMiddleware())
 
-	rgProxy.GET(preauthkeyStr, func (c *gin.Context) {
+	rgProxy.GET(preauthkeyStr, func(c *gin.Context) {
 		c.Request.URL.Path = innerPrefix + preauthkeyStr
 		router.HandleContext(c)
 	})
@@ -168,8 +166,8 @@ func main() {
 		v, ok := data.(map[string]interface{})
 		if !ok {
 			log.Println("not ok")
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
+			// c.AbortWithStatus(http.StatusBadRequest)
+			// return
 		}
 		log.Println(v)
 		type zzz struct {
@@ -198,16 +196,16 @@ func main() {
 		v, ok := data.(map[string]interface{})
 		if !ok {
 			log.Println("not ok")
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
+			// c.AbortWithStatus(http.StatusBadRequest)
+			// return
 		}
 		log.Println(v)
 		type zzz struct {
-			Key string `json:"key,omitempty"`
-			Id string `json:"id,omitempty"`
+			Key  string   `json:"key,omitempty"`
+			Id   string   `json:"id,omitempty"`
 			Tags []string `json:"tags,omitempty"`
-			User string `json:"user,omitempty"`
-			Name string `json:"name,omitempty"`
+			User string   `json:"user,omitempty"`
+			Name string   `json:"name,omitempty"`
 		}
 		var z zzz
 		mapstructure.Decode(v, &z)
@@ -242,7 +240,7 @@ func main() {
 			if z.Tags != nil {
 				v, _ := json.Marshal(map[string][]string{"tags": z.Tags})
 				c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(v))
-		        } else {
+			} else {
 				c.Request.Body = ioutil.NopCloser(bytes.NewBufferString(""))
 			}
 		} else {
@@ -253,7 +251,6 @@ func main() {
 		c.Request.Method = "POST"
 		log.Println("------------------------------>")
 	})
-
 
 	rg := router.Group(innerPrefix)
 
@@ -445,7 +442,7 @@ func newDevice(key, urlSuffix string) (interface{}, error) {
 		SetQueryParam("key", key).
 		SetResult(&result).
 		Post(url + urlSuffix)
-		log.Printf("%+v", resp)
+	log.Printf("%+v", resp)
 	if err != nil {
 		return nil, fmt.Errorf("newDevice failed, err: %s, data: %s", err, resp.String())
 	}
