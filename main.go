@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"github.com/gin-gonic/gin"
 	resty "github.com/go-resty/resty/v2"
-	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/pflag"
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
@@ -162,19 +161,16 @@ func main() {
 	rgProxy.POST("/:name", func(c *gin.Context) {
 		log.Println("one")
 		name := c.Param("name")
-		data, _ := c.Get("data")
-		v, ok := data.(map[string]interface{})
-		if !ok {
-			log.Println("not ok")
-			// c.AbortWithStatus(http.StatusBadRequest)
-			// return
-		}
-		log.Println(v)
+
 		type zzz struct {
 			Id string `json:"id,omitempty"`
 		}
 		var z zzz
-		mapstructure.Decode(v, &z)
+		if err := c.ShouldBindJSON(&z); err != nil {
+			log.Println("Error parsing JSON:", err)
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
 		if name == "machine" && z.Id != "" {
 			c.Request.Method = "DELETE"
 			c.Request.URL.Path = innerPrefix + "/" + name + "/" + z.Id
@@ -191,15 +187,6 @@ func main() {
 		name := c.Param("name")
 		action := c.Param("action")
 
-		data, _ := c.Get("data")
-
-		v, ok := data.(map[string]interface{})
-		if !ok {
-			log.Println("not ok")
-			// c.AbortWithStatus(http.StatusBadRequest)
-			// return
-		}
-		log.Println(v)
 		type zzz struct {
 			Key  string   `json:"key,omitempty"`
 			Id   string   `json:"id,omitempty"`
@@ -208,8 +195,11 @@ func main() {
 			Name string   `json:"name,omitempty"`
 		}
 		var z zzz
-		mapstructure.Decode(v, &z)
-		log.Printf("%+v", z)
+		if err := c.ShouldBindJSON(&z); err != nil {
+			log.Println("Error parsing JSON:", err)
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
 
 		if action == "register" {
 			c.Request.URL.Path = innerPrefix + "/" + name + "/" + action
