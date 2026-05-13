@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	resty "github.com/go-resty/resty/v2"
@@ -10,11 +12,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
-	//	"strconv"
-	"bytes"
-	"encoding/json"
 )
 
 const (
@@ -28,7 +28,7 @@ type response struct {
 }
 
 type createPreAuthKeyRequest struct {
-	User       uint64   `protobuf:"varint,1,opt,name=user,proto3" json:"user"`
+	User       string   `protobuf:"bytes,1,opt,name=user,proto3" json:"user,omitempty"`
 	Reusable   bool     `protobuf:"varint,2,opt,name=reusable,proto3" json:"reusable,omitempty"`
 	Ephemeral  bool     `protobuf:"varint,3,opt,name=ephemeral,proto3" json:"ephemeral,omitempty"`
 	Expiration string   `protobuf:"bytes,4,opt,name=expiration,proto3" json:"expiration,omitempty"`
@@ -37,7 +37,7 @@ type createPreAuthKeyRequest struct {
 
 type listUsersAPIResponse struct {
 	Users []struct {
-		ID   uint64 `json:"id"`
+		ID   string `json:"id"`
 		Name string `json:"name"`
 	} `json:"users"`
 }
@@ -127,7 +127,7 @@ func main() {
 
 		router.GET(proxyPrefix+preauthkeyStr, func(c *gin.Context) {
 
-			uid, err := resolveUserIDByName(user)
+			uid, err := resolveUserIDString(user)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, response{
 					Code:    requestHeadscaleError,
@@ -459,23 +459,30 @@ func newDevice(key, urlSuffix string) (interface{}, error) {
 	return result, nil
 }
 
-func resolveUserIDByName(username string) (uint64, error) {
+func resolveUserIDString(username string) (string, error) {
 	var parsed listUsersAPIResponse
 	resp, err := resty.New().R().SetHeaders(headers).
 		SetResult(&parsed).
 		Get(url + "/user")
 	if err != nil {
-		return 0, fmt.Errorf("list users failed, err: %s, data: %s", err, resp.String())
+		return "", fmt.Errorf("list users failed, err: %s, data: %s", err, resp.String())
 	}
 	if resp.StatusCode() != 200 {
-		return 0, fmt.Errorf("list users failed, data: %s", resp.String())
+		return "", fmt.Errorf("list users failed, data: %s", resp.String())
 	}
 	for _, u := range parsed.Users {
 		if u.Name == username {
-			return u.ID, nil
+			s := strings.TrimSpace(u.ID)
+			if s == "" {
+				return "", fmt.Errorf("empty user id for user %q", u.Name)
+			}
+			if _, err := strconv.ParseUint(s, 10, 64); err != nil {
+				return "", fmt.Errorf("invalid user id %q for user %q: %w", u.ID, u.Name, err)
+			}
+			return s, nil
 		}
 	}
-	return 0, fmt.Errorf("no user with name %q (check headscale users)", username)
+	return "", fmt.Errorf("no user with name %q (check headscale users)", username)
 }
 
 func createPreAuthKey(data *createPreAuthKeyRequest, urlSuffix string) (interface{}, error) {
