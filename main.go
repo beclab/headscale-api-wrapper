@@ -28,11 +28,18 @@ type response struct {
 }
 
 type createPreAuthKeyRequest struct {
-	User       string   `protobuf:"bytes,1,opt,name=user,proto3" json:"user,omitempty"`
+	User       uint64   `protobuf:"varint,1,opt,name=user,proto3" json:"user"`
 	Reusable   bool     `protobuf:"varint,2,opt,name=reusable,proto3" json:"reusable,omitempty"`
 	Ephemeral  bool     `protobuf:"varint,3,opt,name=ephemeral,proto3" json:"ephemeral,omitempty"`
 	Expiration string   `protobuf:"bytes,4,opt,name=expiration,proto3" json:"expiration,omitempty"`
 	AclTags    []string `protobuf:"bytes,5,rep,name=acl_tags,json=aclTags,proto3" json:"aclTags,omitempty"`
+}
+
+type listUsersAPIResponse struct {
+	Users []struct {
+		ID   uint64 `json:"id"`
+		Name string `json:"name"`
+	} `json:"users"`
 }
 
 type OnionRequest struct {
@@ -120,8 +127,16 @@ func main() {
 
 		router.GET(proxyPrefix+preauthkeyStr, func(c *gin.Context) {
 
+			uid, err := resolveUserIDByName(user)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, response{
+					Code:    requestHeadscaleError,
+					Message: err.Error(),
+				})
+				return
+			}
 			data := createPreAuthKeyRequest{
-				User:       user,
+				User:       uid,
 				Reusable:   true,
 				Ephemeral:  false,
 				Expiration: time.Now().UTC().AddDate(10, 0, 0).Format(time.RFC3339),
@@ -442,6 +457,25 @@ func newDevice(key, urlSuffix string) (interface{}, error) {
 	}
 
 	return result, nil
+}
+
+func resolveUserIDByName(username string) (uint64, error) {
+	var parsed listUsersAPIResponse
+	resp, err := resty.New().R().SetHeaders(headers).
+		SetResult(&parsed).
+		Get(url + "/user")
+	if err != nil {
+		return 0, fmt.Errorf("list users failed, err: %s, data: %s", err, resp.String())
+	}
+	if resp.StatusCode() != 200 {
+		return 0, fmt.Errorf("list users failed, data: %s", resp.String())
+	}
+	for _, u := range parsed.Users {
+		if u.Name == username {
+			return u.ID, nil
+		}
+	}
+	return 0, fmt.Errorf("no user with name %q (check headscale users)", username)
 }
 
 func createPreAuthKey(data *createPreAuthKeyRequest, urlSuffix string) (interface{}, error) {
