@@ -4,10 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	resty "github.com/go-resty/resty/v2"
-	"github.com/spf13/pflag"
-	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -15,6 +11,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	resty "github.com/go-resty/resty/v2"
+	"github.com/spf13/pflag"
+	"gopkg.in/yaml.v2"
 )
 
 const (
@@ -53,15 +54,13 @@ type OnionRequest struct {
 var user string = "default"
 var preauthkeyStr string = "/preauthkey"
 var controlUrlStr string = "/controlurl"
-var machineRegisterStr string = "/machine/register"
-var getMachineStr string = "/machine"
-var removeMachineStr string = "/machine/:machineId"
-var renameMachineStr string = "/machine/:machineId/rename/:newName"
-var moveMachineStr string = "/machine/:machineId/user"
-var machineRoutesStr string = "/machine/:machineId/routes"
-var machinetagsStr string = "/machine/:machineId/tags"
-var routeDisableStr string = "/routes/:routeId/disable"
-var routeEnableStr string = "/routes/:routeId/enable"
+var machineRegisterStr string = "/node/register"
+var getMachineStr string = "/node"
+var removeMachineStr string = "/node/:machineId"
+var renameMachineStr string = "/node/:machineId/rename/:newName"
+var moveMachineStr string = "/node/:machineId/user"
+var machinetagsStr string = "/node/:machineId/tags"
+var routeEnableStr string = "/node/approve_routes"
 
 var apiKey string
 var host string
@@ -186,7 +185,7 @@ func main() {
 			c.AbortWithStatus(http.StatusBadRequest)
 			return
 		}
-		if name == "machine" && z.Id != "" {
+		if name == "node" && z.Id != "" {
 			c.Request.Method = "DELETE"
 			c.Request.URL.Path = innerPrefix + "/" + name + "/" + z.Id
 		} else {
@@ -203,11 +202,12 @@ func main() {
 		action := c.Param("action")
 
 		type zzz struct {
-			Key  string   `json:"key,omitempty"`
-			Id   string   `json:"id,omitempty"`
-			Tags []string `json:"tags,omitempty"`
-			User string   `json:"user,omitempty"`
-			Name string   `json:"name,omitempty"`
+			Key    string   `json:"key,omitempty"`
+			Id     string   `json:"id,omitempty"`
+			Tags   []string `json:"tags,omitempty"`
+			Routes []string `json:"routes,omitempty"`
+			User   string   `json:"user,omitempty"`
+			Name   string   `json:"name,omitempty"`
 		}
 		var z zzz
 		if err := c.ShouldBindJSON(&z); err != nil {
@@ -231,16 +231,20 @@ func main() {
 		} else if action == "delete" {
 			c.Request.URL.Path = innerPrefix + "/" + name + "/" + z.Id
 			c.Request.Method = "DELETE"
-		} else if action == "routes" {
-			c.Request.URL.Path = innerPrefix + "/" + name + "/" + z.Id + "/" + action
+		} else if action == "approve_routes" {
+			c.Request.URL.Path = innerPrefix + routeEnableStr
 		} else {
 			c.Request.URL.Path = innerPrefix + "/" + name + "/" + z.Id + "/" + action
 		}
 
 		log.Println(c.Request.URL.Path)
 
-		if action == "routes" {
-			c.Request.Method = "GET"
+		if action == "approve_routes" {
+			v, _ := json.Marshal(map[string]interface{}{
+				"id":     z.Id,
+				"routes": z.Routes,
+			})
+			c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(v))
 		} else if action == "tags" {
 			if z.Tags != nil {
 				v, _ := json.Marshal(map[string][]string{"tags": z.Tags})
@@ -361,23 +365,6 @@ func main() {
 		})
 	})
 
-	rg.GET(machineRoutesStr, func(c *gin.Context) {
-		machineId := c.Param("machineId")
-		routes, err := getMachineRoutes(strings.Replace(machineRoutesStr, ":machineId", machineId, 1))
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-		c.JSON(http.StatusOK, response{
-			Code:    0,
-			Message: "",
-			Data:    routes,
-		})
-	})
-
 	rg.POST(machinetagsStr, func(c *gin.Context) {
 		machineId := c.Param("machineId")
 		data, err := c.GetRawData()
@@ -404,25 +391,18 @@ func main() {
 	})
 
 	rg.POST(routeEnableStr, func(c *gin.Context) {
-		routeId := c.Param("routeId")
-		result, err := routeEnable(strings.Replace(routeEnableStr, ":routeId", routeId, 1))
-		if err != nil {
+		var req struct {
+			Id     string   `json:"id"`
+			Routes []string `json:"routes"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusInternalServerError, response{
 				Code:    requestHeadscaleError,
 				Message: err.Error(),
 			})
 			return
 		}
-		c.JSON(http.StatusOK, response{
-			Code:    0,
-			Message: "",
-			Data:    result,
-		})
-	})
-
-	rg.POST(routeDisableStr, func(c *gin.Context) {
-		routeId := c.Param("routeId")
-		result, err := routeDisable(strings.Replace(routeDisableStr, ":routeId", routeId, 1))
+		result, err := routeEnable(req.Id, req.Routes)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, response{
 				Code:    requestHeadscaleError,
@@ -589,17 +569,22 @@ func moveDevice(urlSuffix, user string) (interface{}, error) {
 	return result, nil
 }
 
-func getMachineRoutes(urlSuffix string) (interface{}, error) {
+func routeEnable(nodeID string, routes []string) (interface{}, error) {
 	var result interface{}
+	body := map[string][]string{"routes": routes}
+	if routes == nil {
+		body["routes"] = []string{}
+	}
 	resp, err := resty.New().R().SetHeaders(headers).
+		SetBody(body).
 		SetResult(&result).
-		Get(url + urlSuffix)
+		Post(url + "/node/" + nodeID + "/approve_routes")
 	if err != nil {
-		return nil, fmt.Errorf("getMachineRoutes failed, err: %s, data: %s", err, resp.String())
+		return nil, fmt.Errorf("routeEnable failed, err: %s, data: %s", err, resp.String())
 	}
 
 	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("getMachineRoutes failed, data: %s", resp.String())
+		return nil, fmt.Errorf("routeEnable failed, data: %s", resp.String())
 	}
 
 	return result, nil
@@ -617,38 +602,6 @@ func updateTags(urlSuffix string, data []byte) (interface{}, error) {
 
 	if resp.StatusCode() != 200 {
 		return nil, fmt.Errorf("updateTags failed, data: %s", resp.String())
-	}
-
-	return result, nil
-}
-
-func routeEnable(urlSuffix string) (interface{}, error) {
-	var result interface{}
-	resp, err := resty.New().R().SetHeaders(headers).
-		SetResult(&result).
-		Post(url + urlSuffix)
-	if err != nil {
-		return nil, fmt.Errorf("routeEnable failed, err: %s, data: %s", err, resp.String())
-	}
-
-	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("routeEnable failed, data: %s", resp.String())
-	}
-
-	return result, nil
-}
-
-func routeDisable(urlSuffix string) (interface{}, error) {
-	var result interface{}
-	resp, err := resty.New().R().SetHeaders(headers).
-		SetResult(&result).
-		Post(url + urlSuffix)
-	if err != nil {
-		return nil, fmt.Errorf("routeDisable failed, err: %s, data: %s", err, resp.String())
-	}
-
-	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("routeDisable failed, data: %s", resp.String())
 	}
 
 	return result, nil
