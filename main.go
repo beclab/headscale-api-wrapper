@@ -78,8 +78,8 @@ var innerPrefix string = "/inner"
 
 func init() {
 	apiKey = os.Getenv("APIKEY")
-	if apiKey == "" {
-		panic("need env APIKEY")
+	if !strings.HasPrefix(apiKey, "hskey-api-") {
+		panic("APIKEY must be a hskey-api- key")
 	}
 	pflag.StringVar(&host, "host", "localhost", "headscale server hostname")
 	pflag.IntVar(&port, "port", 8080, "headscale server port")
