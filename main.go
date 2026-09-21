@@ -126,7 +126,16 @@ func main() {
 
 		router.GET(proxyPrefix+preauthkeyStr, func(c *gin.Context) {
 
-			uid, err := resolveUserIDString(user)
+			username := strings.TrimSpace(c.GetHeader("X-BFL-USER"))
+			if username == "" {
+				c.JSON(http.StatusBadRequest, response{
+					Code:    requestHeadscaleError,
+					Message: "missing X-BFL-USER header",
+				})
+				return
+			}
+
+			uid, err := resolveUserIDString(username)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, response{
 					Code:    requestHeadscaleError,
@@ -440,6 +449,10 @@ func newDevice(key, urlSuffix string) (interface{}, error) {
 }
 
 func resolveUserIDString(username string) (string, error) {
+	return resolveUserIDStringWithCreate(username, true)
+}
+
+func resolveUserIDStringWithCreate(username string, createIfMissing bool) (string, error) {
 	var parsed listUsersAPIResponse
 	resp, err := resty.New().R().SetHeaders(headers).
 		SetResult(&parsed).
@@ -462,7 +475,21 @@ func resolveUserIDString(username string) (string, error) {
 			return s, nil
 		}
 	}
-	return "", fmt.Errorf("no user with name %q (check headscale users)", username)
+	if !createIfMissing {
+		return "", fmt.Errorf("user %q was created but could not be found", username)
+	}
+
+	resp, err = resty.New().R().SetHeaders(headers).
+		SetBody(map[string]string{"name": username}).
+		Post(url + "/user")
+	if err != nil {
+		return "", fmt.Errorf("create user failed, err: %s, data: %s", err, resp.String())
+	}
+	if resp.StatusCode() != 200 {
+		return "", fmt.Errorf("create user failed, data: %s", resp.String())
+	}
+
+	return resolveUserIDStringWithCreate(username, false)
 }
 
 func createPreAuthKey(data *createPreAuthKeyRequest, urlSuffix string) (interface{}, error) {
