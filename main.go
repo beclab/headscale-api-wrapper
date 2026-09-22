@@ -147,7 +147,7 @@ func main() {
 				User:       uid,
 				Reusable:   true,
 				Ephemeral:  false,
-				Expiration: time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+				Expiration: time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
 			}
 			fmt.Println(data)
 
