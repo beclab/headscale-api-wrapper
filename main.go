@@ -126,11 +126,11 @@ func main() {
 
 		router.GET(proxyPrefix+preauthkeyStr, func(c *gin.Context) {
 
-			username := strings.TrimSpace(c.GetHeader("X-BFL-USER"))
-			if username == "" {
-				c.JSON(http.StatusBadRequest, response{
+			username, err := authenticatedUser(c.Request)
+			if err != nil {
+				c.JSON(http.StatusUnauthorized, response{
 					Code:    requestHeadscaleError,
-					Message: "missing X-BFL-USER header",
+					Message: err.Error(),
 				})
 				return
 			}
@@ -147,7 +147,7 @@ func main() {
 				User:       uid,
 				Reusable:   true,
 				Ephemeral:  false,
-				Expiration: time.Now().UTC().AddDate(10, 0, 0).Format(time.RFC3339),
+				Expiration: time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
 			}
 			fmt.Println(data)
 
@@ -479,17 +479,23 @@ func resolveUserIDStringWithCreate(username string, createIfMissing bool) (strin
 		return "", fmt.Errorf("user %q was created but could not be found", username)
 	}
 
-	resp, err = resty.New().R().SetHeaders(headers).
+	resp, createErr := resty.New().R().SetHeaders(headers).
 		SetBody(map[string]string{"name": username}).
 		Post(url + "/user")
-	if err != nil {
-		return "", fmt.Errorf("create user failed, err: %s, data: %s", err, resp.String())
+
+	// Another concurrent request may have created the user first. Treat the
+	// create operation as idempotent and use Headscale as the source of truth.
+	uid, lookupErr := resolveUserIDStringWithCreate(username, false)
+	if lookupErr == nil {
+		return uid, nil
 	}
-	if resp.StatusCode() != 200 {
+	if createErr != nil {
+		return "", fmt.Errorf("create user failed, err: %s", createErr)
+	}
+	if resp.StatusCode() != http.StatusOK && resp.StatusCode() != http.StatusCreated {
 		return "", fmt.Errorf("create user failed, data: %s", resp.String())
 	}
-
-	return resolveUserIDStringWithCreate(username, false)
+	return "", lookupErr
 }
 
 func createPreAuthKey(data *createPreAuthKeyRequest, urlSuffix string) (interface{}, error) {
@@ -513,14 +519,14 @@ func getControlURL() (string, error) {
 
 	source, err := ioutil.ReadFile(config)
 	if err != nil {
-		fmt.Println("failed reading config file: %v", err)
+		fmt.Printf("failed reading config file: %v\n", err)
 		return "", err
 	}
 
 	data := make(map[interface{}]interface{})
 	err = yaml.Unmarshal(source, &data)
 	if err != nil {
-		fmt.Println("unmarshal error: %v", err)
+		fmt.Printf("unmarshal error: %v\n", err)
 		return "", err
 	}
 
