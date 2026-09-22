@@ -6,7 +6,7 @@ COPY . .
 
 RUN go mod tidy && go build \
     -o headscale-api-wrapper \
-    main.go
+    .
 
 FROM alpine:latest
 
