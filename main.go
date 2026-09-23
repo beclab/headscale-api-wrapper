@@ -126,7 +126,16 @@ func main() {
 
 		router.GET(proxyPrefix+preauthkeyStr, func(c *gin.Context) {
 
-			uid, err := resolveUserIDString(user)
+			username, err := authenticatedUser(c.Request)
+			if err != nil {
+				c.JSON(http.StatusUnauthorized, response{
+					Code:    requestHeadscaleError,
+					Message: err.Error(),
+				})
+				return
+			}
+
+			uid, err := resolveUserIDString(username)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, response{
 					Code:    requestHeadscaleError,
@@ -138,7 +147,7 @@ func main() {
 				User:       uid,
 				Reusable:   true,
 				Ephemeral:  false,
-				Expiration: time.Now().UTC().AddDate(10, 0, 0).Format(time.RFC3339),
+				Expiration: time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
 			}
 			fmt.Println(data)
 
@@ -440,6 +449,10 @@ func newDevice(key, urlSuffix string) (interface{}, error) {
 }
 
 func resolveUserIDString(username string) (string, error) {
+	return resolveUserIDStringWithCreate(username, true)
+}
+
+func resolveUserIDStringWithCreate(username string, createIfMissing bool) (string, error) {
 	var parsed listUsersAPIResponse
 	resp, err := resty.New().R().SetHeaders(headers).
 		SetResult(&parsed).
@@ -462,7 +475,27 @@ func resolveUserIDString(username string) (string, error) {
 			return s, nil
 		}
 	}
-	return "", fmt.Errorf("no user with name %q (check headscale users)", username)
+	if !createIfMissing {
+		return "", fmt.Errorf("user %q was created but could not be found", username)
+	}
+
+	resp, createErr := resty.New().R().SetHeaders(headers).
+		SetBody(map[string]string{"name": username}).
+		Post(url + "/user")
+
+	// Another concurrent request may have created the user first. Treat the
+	// create operation as idempotent and use Headscale as the source of truth.
+	uid, lookupErr := resolveUserIDStringWithCreate(username, false)
+	if lookupErr == nil {
+		return uid, nil
+	}
+	if createErr != nil {
+		return "", fmt.Errorf("create user failed, err: %s", createErr)
+	}
+	if resp.StatusCode() != http.StatusOK && resp.StatusCode() != http.StatusCreated {
+		return "", fmt.Errorf("create user failed, data: %s", resp.String())
+	}
+	return "", lookupErr
 }
 
 func createPreAuthKey(data *createPreAuthKeyRequest, urlSuffix string) (interface{}, error) {
@@ -486,14 +519,14 @@ func getControlURL() (string, error) {
 
 	source, err := ioutil.ReadFile(config)
 	if err != nil {
-		fmt.Println("failed reading config file: %v", err)
+		fmt.Printf("failed reading config file: %v\n", err)
 		return "", err
 	}
 
 	data := make(map[interface{}]interface{})
 	err = yaml.Unmarshal(source, &data)
 	if err != nil {
-		fmt.Println("unmarshal error: %v", err)
+		fmt.Printf("unmarshal error: %v\n", err)
 		return "", err
 	}
 
