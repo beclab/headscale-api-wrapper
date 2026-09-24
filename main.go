@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -15,7 +13,6 @@ import (
 	"github.com/gin-gonic/gin"
 	resty "github.com/go-resty/resty/v2"
 	"github.com/spf13/pflag"
-	"gopkg.in/yaml.v2"
 )
 
 const (
@@ -43,23 +40,21 @@ type listUsersAPIResponse struct {
 	} `json:"users"`
 }
 
-type OnionRequest struct {
-	Op       string      `json:"op"`
-	DataType string      `json:"dataType"`
-	Version  string      `json:"version"`
-	Group    string      `json:"group"`
-	Data     interface{} `json:"data"`
+type listNodesAPIResponse struct {
+	Nodes []json.RawMessage `json:"nodes"`
 }
 
-var user string = "default"
+type nodeIdentity struct {
+	ID   string `json:"id"`
+	User struct {
+		Name string `json:"name"`
+	} `json:"user"`
+}
+
 var preauthkeyStr string = "/preauthkey"
-var controlUrlStr string = "/controlurl"
-var machineRegisterStr string = "/node/register"
 var getMachineStr string = "/node"
 var removeMachineStr string = "/node/:machineId"
 var renameMachineStr string = "/node/:machineId/rename/:newName"
-var moveMachineStr string = "/node/:machineId/user"
-var machinetagsStr string = "/node/:machineId/tags"
 var routeEnableStr string = "/node/approve_routes"
 
 var apiKey string
@@ -68,13 +63,10 @@ var port int
 var url string
 var config string
 
-type Response struct {
-	ControlURL string `json:"controlurl"`
-}
-
 var headers map[string]string
 var proxyPrefix string = "/headscale"
-var innerPrefix string = "/inner"
+
+const authenticatedUserContextKey = "authenticated-user"
 
 func init() {
 	apiKey = os.Getenv("APIKEY")
@@ -83,7 +75,7 @@ func init() {
 	}
 	pflag.StringVar(&host, "host", "localhost", "headscale server hostname")
 	pflag.IntVar(&port, "port", 8080, "headscale server port")
-	pflag.StringVar(&config, "config", "/etc/headscale/config.yaml", "headscale config file")
+	pflag.StringVar(&config, "config", "/etc/headscale/config.yaml", "deprecated headscale config file")
 	pflag.Parse()
 	url = fmt.Sprintf("http://%s:%d/api/v1", host, port)
 	// url = "https://headscale.hu9443.snowinning.com/api/v1"
@@ -92,29 +84,40 @@ func init() {
 	}
 }
 
-func ProxyMiddleware() gin.HandlerFunc {
+func requireAuthenticatedUser() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		log.Println("ProxyMiddleware")
-		log.Println(c.Request.URL.Path)
-		if c.Request.Method == "GET" && c.Request.URL.Path == proxyPrefix+preauthkeyStr {
-			return
-		}
-		var oreq OnionRequest
-		err := c.ShouldBindJSON(&oreq)
+		username, err := authenticatedUser(c.Request)
 		if err != nil {
-			c.Error(err)
-			c.AbortWithStatus(http.StatusBadRequest)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, response{
+				Code:    requestHeadscaleError,
+				Message: err.Error(),
+			})
 			return
 		}
-		log.Printf("%+v", oreq)
-		if oreq.Data == nil {
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
-		c.Set("data", oreq.Data)
 
+		c.Set(authenticatedUserContextKey, username)
 		c.Next()
 	}
+}
+
+func requireOwnedNode(c *gin.Context, nodeID string) bool {
+	username := c.GetString(authenticatedUserContextKey)
+	owned, err := userOwnsNode(username, nodeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, response{
+			Code:    requestHeadscaleError,
+			Message: err.Error(),
+		})
+		return false
+	}
+	if !owned {
+		c.JSON(http.StatusForbidden, response{
+			Code:    requestHeadscaleError,
+			Message: "node does not belong to the authenticated user",
+		})
+		return false
+	}
+	return true
 }
 
 func main() {
@@ -174,244 +177,94 @@ func main() {
 	router.SetTrustedProxies(nil)
 
 	rgProxy := router.Group(proxyPrefix)
-	// rgProxy.Use(ProxyMiddleware())
-
-	rgProxy.GET(preauthkeyStr, func(c *gin.Context) {
-		c.Request.URL.Path = innerPrefix + preauthkeyStr
-		router.HandleContext(c)
-	})
-
-	rgProxy.POST("/:name", func(c *gin.Context) {
-		log.Println("one")
-		name := c.Param("name")
-
-		type zzz struct {
-			Id string `json:"id,omitempty"`
-		}
-		var z zzz
-		if err := c.ShouldBindJSON(&z); err != nil {
-			log.Println("Error parsing JSON:", err)
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
-		if name == "node" && z.Id != "" {
-			c.Request.Method = "DELETE"
-			c.Request.URL.Path = innerPrefix + "/" + name + "/" + z.Id
-		} else {
-			c.Request.Method = "GET"
-			c.Request.URL.Path = innerPrefix + "/" + name
-		}
-		router.HandleContext(c)
-		c.Request.Method = "POST"
-	})
-
-	rgProxy.POST("/:name/:action", func(c *gin.Context) {
-		log.Println("two")
-		name := c.Param("name")
-		action := c.Param("action")
-
-		type zzz struct {
-			Key    string   `json:"key,omitempty"`
-			Id     string   `json:"id,omitempty"`
-			Tags   []string `json:"tags,omitempty"`
-			Routes []string `json:"routes,omitempty"`
-			User   string   `json:"user,omitempty"`
-			Name   string   `json:"name,omitempty"`
-		}
-		var z zzz
-		if err := c.ShouldBindJSON(&z); err != nil {
-			log.Println("Error parsing JSON:", err)
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
-
-		if action == "register" {
-			c.Request.URL.Path = innerPrefix + "/" + name + "/" + action
-			q := c.Request.URL.Query()
-			q.Add("key", z.Key)
-			c.Request.URL.RawQuery = q.Encode()
-		} else if action == "user" {
-			c.Request.URL.Path = innerPrefix + "/" + name + "/" + z.Id + "/" + action
-			q := c.Request.URL.Query()
-			q.Add("user", z.User)
-			c.Request.URL.RawQuery = q.Encode()
-		} else if action == "rename" {
-			c.Request.URL.Path = innerPrefix + "/" + name + "/" + z.Id + "/" + action + "/" + z.Name
-		} else if action == "delete" {
-			c.Request.URL.Path = innerPrefix + "/" + name + "/" + z.Id
-			c.Request.Method = "DELETE"
-		} else if action == "approve_routes" {
-			c.Request.URL.Path = innerPrefix + routeEnableStr
-		} else {
-			c.Request.URL.Path = innerPrefix + "/" + name + "/" + z.Id + "/" + action
-		}
-
-		log.Println(c.Request.URL.Path)
-
-		if action == "approve_routes" {
-			v, _ := json.Marshal(map[string]interface{}{
-				"id":     z.Id,
-				"routes": z.Routes,
-			})
-			c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(v))
-		} else if action == "tags" {
-			if z.Tags != nil {
-				v, _ := json.Marshal(map[string][]string{"tags": z.Tags})
-				c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(v))
-			} else {
-				c.Request.Body = ioutil.NopCloser(bytes.NewBufferString(""))
-			}
-		} else {
-			c.Request.Body = ioutil.NopCloser(bytes.NewBufferString(""))
-		}
-
-		router.HandleContext(c)
-		c.Request.Method = "POST"
-		log.Println("------------------------------>")
-	})
-
-	rg := router.Group(innerPrefix)
-
-	rg.POST(machineRegisterStr, func(c *gin.Context) {
-		key := c.Query("key")
-		resp, err := newDevice(key, machineRegisterStr)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-		c.JSON(http.StatusOK, response{
-			Code:    0,
-			Message: "",
-			Data:    resp,
-		})
-	})
-
-	rg.GET(controlUrlStr, func(c *gin.Context) {
-		controlUrl, err := getControlURL()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-		c.JSON(http.StatusOK, response{
-			Code:    0,
-			Message: "",
-			Data:    gin.H{"controlUrl": controlUrl},
-		})
-	})
-
-	rg.GET(getMachineStr, func(c *gin.Context) {
-		machines, err := getDevices(getMachineStr)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-		c.JSON(http.StatusOK, response{
-			Code:    0,
-			Message: "",
-			Data:    machines,
-		})
-	})
-
-	rg.DELETE(removeMachineStr, func(c *gin.Context) {
-		machineId := c.Param("machineId")
-		machines, err := removeDevice(strings.Replace(removeMachineStr, ":machineId", machineId, 1))
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-		c.JSON(http.StatusOK, response{
-			Code:    0,
-			Message: "",
-			Data:    machines,
-		})
-	})
-
-	rg.POST(renameMachineStr, func(c *gin.Context) {
-		machineId := c.Param("machineId")
-		newName := c.Param("newName")
-		machines, err := renameDevice(strings.Replace(strings.Replace(renameMachineStr, ":machineId", machineId, 1), ":newName", newName, 1))
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-		c.JSON(http.StatusOK, response{
-			Code:    0,
-			Message: "",
-			Data:    machines,
-		})
-	})
-
-	rg.POST(moveMachineStr, func(c *gin.Context) {
-		machineId := c.Param("machineId")
-		user := c.Query("user")
-		machines, err := moveDevice(strings.Replace(moveMachineStr, ":machineId", machineId, 1), user)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-		c.JSON(http.StatusOK, response{
-			Code:    0,
-			Message: "",
-			Data:    machines,
-		})
-	})
-
-	rg.POST(machinetagsStr, func(c *gin.Context) {
-		machineId := c.Param("machineId")
-		data, err := c.GetRawData()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-		routes, err := updateTags(strings.Replace(machinetagsStr, ":machineId", machineId, 1), data)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-		c.JSON(http.StatusOK, response{
-			Code:    0,
-			Message: "",
-			Data:    routes,
-		})
-	})
-
-	rg.POST(routeEnableStr, func(c *gin.Context) {
+	rgProxy.Use(requireAuthenticatedUser())
+	rgProxy.POST(getMachineStr, func(c *gin.Context) {
 		var req struct {
-			Id     string   `json:"id"`
+			ID string `json:"id,omitempty"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, response{
+				Code:    requestHeadscaleError,
+				Message: err.Error(),
+			})
+			return
+		}
+
+		if req.ID != "" {
+			if !requireOwnedNode(c, req.ID) {
+				return
+			}
+			machines, err := removeDevice(strings.Replace(removeMachineStr, ":machineId", req.ID, 1))
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, response{
+					Code:    requestHeadscaleError,
+					Message: err.Error(),
+				})
+				return
+			}
+			c.JSON(http.StatusOK, response{Code: 0, Message: "", Data: machines})
+			return
+		}
+
+		machines, err := getDevicesForUser(c.GetString(authenticatedUserContextKey))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, response{
+				Code:    requestHeadscaleError,
+				Message: err.Error(),
+			})
+			return
+		}
+		c.JSON(http.StatusOK, response{
+			Code:    0,
+			Message: "",
+			Data:    machines,
+		})
+	})
+
+	rgProxy.POST("/node/rename", func(c *gin.Context) {
+		var req struct {
+			ID   string `json:"id" binding:"required"`
+			Name string `json:"name" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: err.Error()})
+			return
+		}
+		if !requireOwnedNode(c, req.ID) {
+			return
+		}
+
+		machines, err := renameDevice(strings.Replace(strings.Replace(renameMachineStr, ":machineId", req.ID, 1), ":newName", req.Name, 1))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, response{
+				Code:    requestHeadscaleError,
+				Message: err.Error(),
+			})
+			return
+		}
+		c.JSON(http.StatusOK, response{
+			Code:    0,
+			Message: "",
+			Data:    machines,
+		})
+	})
+
+	rgProxy.POST(routeEnableStr, func(c *gin.Context) {
+		var req struct {
+			ID     string   `json:"id" binding:"required"`
 			Routes []string `json:"routes"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusInternalServerError, response{
+			c.JSON(http.StatusBadRequest, response{
 				Code:    requestHeadscaleError,
 				Message: err.Error(),
 			})
 			return
 		}
-		result, err := routeEnable(req.Id, req.Routes)
+		if !requireOwnedNode(c, req.ID) {
+			return
+		}
+		result, err := routeEnable(req.ID, req.Routes)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, response{
 				Code:    requestHeadscaleError,
@@ -427,25 +280,6 @@ func main() {
 	})
 
 	router.Run(":8000")
-}
-
-func newDevice(key, urlSuffix string) (interface{}, error) {
-	var result interface{}
-	resp, err := resty.New().R().SetHeaders(headers).
-		SetQueryParam("user", user).
-		SetQueryParam("key", key).
-		SetResult(&result).
-		Post(url + urlSuffix)
-	log.Printf("%+v", resp)
-	if err != nil {
-		return nil, fmt.Errorf("newDevice failed, err: %s, data: %s", err, resp.String())
-	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("newDevice failed, data: %s", resp.String())
-	}
-
-	return result, nil
 }
 
 func resolveUserIDString(username string) (string, error) {
@@ -515,40 +349,60 @@ func createPreAuthKey(data *createPreAuthKeyRequest, urlSuffix string) (interfac
 	return result, nil
 }
 
-func getControlURL() (string, error) {
-
-	source, err := ioutil.ReadFile(config)
-	if err != nil {
-		fmt.Printf("failed reading config file: %v\n", err)
-		return "", err
-	}
-
-	data := make(map[interface{}]interface{})
-	err = yaml.Unmarshal(source, &data)
-	if err != nil {
-		fmt.Printf("unmarshal error: %v\n", err)
-		return "", err
-	}
-
-	fmt.Printf("server_url: %+v\n", data["server_url"])
-
-	return data["server_url"].(string), nil
-}
-
-func getDevices(urlSuffix string) (interface{}, error) {
-	var result interface{}
+func listDevices() (listNodesAPIResponse, error) {
+	var result listNodesAPIResponse
 	resp, err := resty.New().R().SetHeaders(headers).
 		SetResult(&result).
-		Get(url + urlSuffix)
+		Get(url + getMachineStr)
 	if err != nil {
-		return nil, fmt.Errorf("getDevices failed, err: %s, data: %s", err, resp.String())
+		return listNodesAPIResponse{}, fmt.Errorf("getDevices failed, err: %s, data: %s", err, resp.String())
 	}
 
 	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("getDevices failed, data: %s", resp.String())
+		return listNodesAPIResponse{}, fmt.Errorf("getDevices failed, data: %s", resp.String())
 	}
 
 	return result, nil
+}
+
+func getDevicesForUser(username string) (listNodesAPIResponse, error) {
+	result, err := listDevices()
+	if err != nil {
+		return listNodesAPIResponse{}, err
+	}
+
+	filtered := make([]json.RawMessage, 0, len(result.Nodes))
+	for _, rawNode := range result.Nodes {
+		var node nodeIdentity
+		if err := json.Unmarshal(rawNode, &node); err != nil {
+			return listNodesAPIResponse{}, fmt.Errorf("decode node identity failed: %w", err)
+		}
+		if node.User.Name == username {
+			filtered = append(filtered, rawNode)
+		}
+	}
+
+	result.Nodes = filtered
+	return result, nil
+}
+
+func userOwnsNode(username, nodeID string) (bool, error) {
+	result, err := listDevices()
+	if err != nil {
+		return false, err
+	}
+
+	for _, rawNode := range result.Nodes {
+		var node nodeIdentity
+		if err := json.Unmarshal(rawNode, &node); err != nil {
+			return false, fmt.Errorf("decode node identity failed: %w", err)
+		}
+		if node.ID == nodeID {
+			return node.User.Name == username, nil
+		}
+	}
+
+	return false, nil
 }
 
 func removeDevice(urlSuffix string) (interface{}, error) {
@@ -583,25 +437,6 @@ func renameDevice(urlSuffix string) (interface{}, error) {
 	return result, nil
 }
 
-func moveDevice(urlSuffix, user string) (interface{}, error) {
-	fmt.Println(urlSuffix)
-	fmt.Println(user)
-	var result interface{}
-	resp, err := resty.New().R().SetHeaders(headers).
-		SetQueryParam("user", user).
-		SetResult(&result).
-		Post(url + urlSuffix)
-	if err != nil {
-		return nil, fmt.Errorf("moveDevice failed, err: %s, data: %s", err, resp.String())
-	}
-
-	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("moveDevice failed, data: %s", resp.String())
-	}
-
-	return result, nil
-}
-
 func routeEnable(nodeID string, routes []string) (interface{}, error) {
 	var result interface{}
 	body := map[string][]string{"routes": routes}
@@ -618,23 +453,6 @@ func routeEnable(nodeID string, routes []string) (interface{}, error) {
 
 	if resp.StatusCode() != 200 {
 		return nil, fmt.Errorf("routeEnable failed, data: %s", resp.String())
-	}
-
-	return result, nil
-}
-
-func updateTags(urlSuffix string, data []byte) (interface{}, error) {
-	var result interface{}
-	resp, err := resty.New().R().SetHeaders(headers).
-		SetBody(data).
-		SetResult(&result).
-		Post(url + urlSuffix)
-	if err != nil {
-		return nil, fmt.Errorf("updateTags failed, err: %s, data: %s", err, resp.String())
-	}
-
-	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("updateTags failed, data: %s", resp.String())
 	}
 
 	return result, nil
