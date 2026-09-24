@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -65,6 +66,8 @@ var config string
 
 var headers map[string]string
 var proxyPrefix string = "/headscale"
+
+var policyUpdateMu sync.Mutex
 
 const authenticatedUserContextKey = "authenticated-user"
 
@@ -175,6 +178,11 @@ func main() {
 	// gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 	router.SetTrustedProxies(nil)
+
+	internal := router.Group("/internal")
+	internal.Use(requireServiceAccount())
+	internal.GET("/policy/application-ports", getApplicationPorts)
+	internal.PUT("/policy/application-ports", putApplicationPorts)
 
 	rgProxy := router.Group(proxyPrefix)
 	rgProxy.Use(requireAuthenticatedUser())
