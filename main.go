@@ -186,6 +186,9 @@ func main() {
 
 	rgProxy := router.Group(proxyPrefix)
 	rgProxy.Use(requireAuthenticatedUser())
+	rgProxy.GET("/policy/exit-users", requireOwner(), getExitUsers)
+	rgProxy.PUT("/policy/exit-users/:username", requireOwner(), grantExitUser)
+	rgProxy.DELETE("/policy/exit-users/:username", requireOwner(), revokeExitUser)
 	rgProxy.POST(getMachineStr, func(c *gin.Context) {
 		var req struct {
 			ID string `json:"id,omitempty"`
