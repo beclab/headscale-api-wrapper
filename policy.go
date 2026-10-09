@@ -517,10 +517,10 @@ func rejectWildcardApplicationPorts(entries []userProtocolPorts) error {
 
 func validatePolicyUsername(user string) error {
 	if user == "" {
-		return errors.New("application port owner is empty")
+		return errors.New("policy username is empty")
 	}
 	if strings.ContainsAny(user, "@:") || strings.IndexFunc(user, unicode.IsSpace) >= 0 {
-		return fmt.Errorf("application port owner %q is not a valid Headscale username", user)
+		return fmt.Errorf("policy username %q is not a valid Headscale username", user)
 	}
 	return nil
 }

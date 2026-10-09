@@ -8,6 +8,7 @@ This document describes the APIs exposed by `headscale-api-wrapper` to other Ola
 | --- | --- | --- | --- | --- |
 | Auth key | Vault/LarePass call chain | `9000` | `/headscale` | Olares AccessToken |
 | User device management | Settings and user-service | `8000` | `/headscale` | Olares AccessToken |
+| Exit-node access management | Settings owner | `8000` | `/headscale/policy/exit-users` | Olares AccessToken |
 | Platform policy management | app-service | `8000` | `/internal/policy` | Kubernetes ServiceAccount token |
 
 Recommended in-cluster addresses:
@@ -36,7 +37,7 @@ Common HTTP status codes:
 - `200`: success.
 - `400`: invalid request body or port format.
 - `401`: missing or invalid AccessToken or ServiceAccount token.
-- `403`: the node does not belong to the current user, or the ServiceAccount is not authorized.
+- `403`: the node does not belong to the current user, the user is not the Olares owner, or the ServiceAccount is not authorized.
 - `409`: the current policy structure cannot be modified safely.
 - `500`: the wrapper failed to read or parse state.
 - `502`: a Headscale API call failed.
@@ -168,6 +169,32 @@ Request body:
 - The wrapper verifies ownership before applying the change.
 
 The user-facing APIs do not support transferring nodes between users or assigning arbitrary tags. This prevents users from bypassing shared-Headscale ACL isolation by changing node ownership or tags.
+
+### 5.5 Manage exit-node users
+
+Only the authenticated Olares owner may manage the users allowed to use the
+Olares exit node. The wrapper verifies the AccessToken username and requires
+the matching Olares User to have `bytetrade.io/owner-role: owner`.
+
+```http
+GET /headscale/policy/exit-users
+PUT /headscale/policy/exit-users/:username
+DELETE /headscale/policy/exit-users/:username
+```
+
+- `GET` lists the authorized Olares usernames.
+- `PUT` grants exit-node access and always ensures that the matching Headscale
+  user exists, including when the policy membership is already unchanged.
+- `DELETE` revokes exit-node access.
+- `:username` is the Olares username without the trailing `@` used by
+  Headscale policy aliases.
+- Repeating the same grant or revoke is a successful no-op with
+  `"changed": false`.
+
+The wrapper changes only `groups["group:exit-users"]`. It refuses the update
+if the managed group or its single canonical `autogroup:internet:*` ACL rule is
+missing or ambiguous. Headscale validates, stores, and reloads the updated
+database policy immediately; no pod restart is required.
 
 ## 6. Platform policy management APIs
 
