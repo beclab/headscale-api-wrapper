@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -34,10 +35,14 @@ func (e *policyShapeError) Error() string {
 }
 
 func getExitUsers(c *gin.Context) {
-	policyUpdateMu.Lock()
-	defer policyUpdateMu.Unlock()
+	cancel := beginPolicyOperation(c)
+	defer cancel()
+	if !lockPolicy(c) {
+		return
+	}
+	defer unlockPolicy()
 
-	state, _, err := loadExitUsers()
+	state, _, err := loadExitUsers(c.Request.Context())
 	if err != nil {
 		writeExitUsersError(c, err)
 		return
@@ -46,10 +51,14 @@ func getExitUsers(c *gin.Context) {
 }
 
 func grantExitUser(c *gin.Context) {
+	cancel := beginPolicyOperation(c)
+	defer cancel()
 	updateExitUser(c, true)
 }
 
 func revokeExitUser(c *gin.Context) {
+	cancel := beginPolicyOperation(c)
+	defer cancel()
 	updateExitUser(c, false)
 }
 
@@ -60,10 +69,12 @@ func updateExitUser(c *gin.Context, grant bool) {
 		return
 	}
 
-	policyUpdateMu.Lock()
-	defer policyUpdateMu.Unlock()
+	if !lockPolicy(c) {
+		return
+	}
+	defer unlockPolicy()
 
-	state, document, err := loadExitUsers()
+	state, document, err := loadExitUsers(c.Request.Context())
 	if err != nil {
 		writeExitUsersError(c, err)
 		return
@@ -75,10 +86,14 @@ func updateExitUser(c *gin.Context, grant bool) {
 		return
 	}
 	if grant {
+		if err := validateOlaresUsers(c.Request.Context(), []string{username}); err != nil {
+			c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: err.Error()})
+			return
+		}
 		// Headscale validates user aliases during policy updates. Creating the
 		// corresponding user does not grant access by itself. Always ensure it
 		// exists so an idempotent grant also repairs a missing identity record.
-		if _, err := resolveUserIDString(username); err != nil {
+		if _, err := resolveUserIDString(c.Request.Context(), username); err != nil {
 			c.JSON(http.StatusBadGateway, response{
 				Code:    requestHeadscaleError,
 				Message: fmt.Sprintf("ensure Headscale user %q: %v", username, err),
@@ -93,7 +108,7 @@ func updateExitUser(c *gin.Context, grant bool) {
 			c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
 			return
 		}
-		updatedAt, err := setHeadscalePolicy(string(encoded))
+		updatedAt, err := setHeadscalePolicy(c.Request.Context(), string(encoded))
 		if err != nil {
 			c.JSON(http.StatusBadGateway, response{Code: requestHeadscaleError, Message: err.Error()})
 			return
@@ -107,8 +122,8 @@ func updateExitUser(c *gin.Context, grant bool) {
 	c.JSON(http.StatusOK, response{Code: 0, Message: "", Data: state})
 }
 
-func loadExitUsers() (exitUsersState, *policyDocument, error) {
-	policy, err := getHeadscalePolicy()
+func loadExitUsers(ctx context.Context) (exitUsersState, *policyDocument, error) {
+	policy, err := getHeadscalePolicy(ctx)
 	if err != nil {
 		return exitUsersState{}, nil, err
 	}
