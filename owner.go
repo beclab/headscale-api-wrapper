@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -23,14 +24,27 @@ var verifyOlaresOwner = isOlaresOwner
 
 type olaresUser struct {
 	Metadata struct {
-		Annotations map[string]string `json:"annotations"`
+		Name              string            `json:"name"`
+		Annotations       map[string]string `json:"annotations"`
+		DeletionTimestamp *string           `json:"deletionTimestamp"`
 	} `json:"metadata"`
+	Status struct {
+		State string `json:"state"`
+	} `json:"status"`
+}
+
+func (u olaresUser) availableForAuthorization() bool {
+	return u.Status.State == "Created" && u.Metadata.DeletionTimestamp == nil
 }
 
 func requireOwner() gin.HandlerFunc {
+	return requireOwnerFor("manage exit-node access")
+}
+
+func requireOwnerFor(action string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		username := c.GetString(authenticatedUserContextKey)
-		owner, err := verifyOlaresOwner(username)
+		owner, err := verifyOlaresOwner(c.Request.Context(), username)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusBadGateway, response{
 				Code:    requestHeadscaleError,
@@ -41,7 +55,7 @@ func requireOwner() gin.HandlerFunc {
 		if !owner {
 			c.AbortWithStatusJSON(http.StatusForbidden, response{
 				Code:    requestHeadscaleError,
-				Message: "only the Olares owner may manage exit-node access",
+				Message: "only the Olares owner may " + action,
 			})
 			return
 		}
@@ -49,7 +63,17 @@ func requireOwner() gin.HandlerFunc {
 	}
 }
 
-func isOlaresOwner(username string) (bool, error) {
+func isOlaresOwner(ctx context.Context, username string) (bool, error) {
+	if strings.TrimSpace(username) == "" {
+		return false, errors.New("authenticated Olares username is empty")
+	}
+	var user olaresUser
+	found, err := readOlaresResource(ctx, "/"+neturl.PathEscape(username), &user)
+	return found && user.Metadata.Annotations[ownerRoleAnnotation] == "owner", err
+}
+
+func readOlaresResource(ctx context.Context, suffix string, result any) (bool, error) {
+	username := suffix
 	username = strings.TrimSpace(username)
 	if username == "" {
 		return false, errors.New("authenticated Olares username is empty")
@@ -78,11 +102,11 @@ func isOlaresOwner(username string) (bool, error) {
 	}
 
 	endpoint := fmt.Sprintf(
-		"https://%s/apis/iam.kubesphere.io/v1alpha2/users/%s",
+		"https://%s/apis/iam.kubesphere.io/v1alpha2/users%s",
 		net.JoinHostPort(host, port),
-		neturl.PathEscape(username),
+		suffix,
 	)
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return false, fmt.Errorf("create Olares user request: %w", err)
 	}
@@ -95,6 +119,7 @@ func isOlaresOwner(username string) (bool, error) {
 			RootCAs:    roots,
 		}},
 	}
+	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, fmt.Errorf("get Olares user %q: %w", username, err)
@@ -109,9 +134,8 @@ func isOlaresOwner(username string) (bool, error) {
 		return false, fmt.Errorf("get Olares user %q: status %d: %s", username, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	var user olaresUser
-	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
 		return false, fmt.Errorf("decode Olares user %q: %w", username, err)
 	}
-	return user.Metadata.Annotations[ownerRoleAnnotation] == "owner", nil
+	return true, nil
 }

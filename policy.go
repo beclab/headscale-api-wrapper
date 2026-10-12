@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,7 +11,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 	"unicode"
 
 	"github.com/gin-gonic/gin"
@@ -121,10 +121,14 @@ type policyDocument struct {
 }
 
 func getApplicationPorts(c *gin.Context) {
-	policyUpdateMu.Lock()
-	defer policyUpdateMu.Unlock()
+	cancel := beginPolicyOperation(c)
+	defer cancel()
+	if !lockPolicy(c) {
+		return
+	}
+	defer unlockPolicy()
 
-	state, err := readApplicationPorts()
+	state, err := readApplicationPorts(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
 		return
@@ -133,6 +137,8 @@ func getApplicationPorts(c *gin.Context) {
 }
 
 func putApplicationPorts(c *gin.Context) {
+	cancel := beginPolicyOperation(c)
+	defer cancel()
 	var request applicationPortsRequest
 	if err := c.ShouldBindJSON(&request); err != nil {
 		c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: err.Error()})
@@ -153,10 +159,12 @@ func putApplicationPorts(c *gin.Context) {
 	}
 	requested = subtractUserDefaultPorts(requested, defaultApplicationServicePorts)
 
-	policyUpdateMu.Lock()
-	defer policyUpdateMu.Unlock()
+	if !lockPolicy(c) {
+		return
+	}
+	defer unlockPolicy()
 
-	current, document, err := loadApplicationPorts()
+	current, document, err := loadApplicationPorts(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
 		return
@@ -168,7 +176,7 @@ func putApplicationPorts(c *gin.Context) {
 		// real Olares owner has a corresponding Headscale user before referencing
 		// owner@. User creation alone grants no network access.
 		for _, entry := range requested {
-			if _, err := resolveUserIDString(entry.User); err != nil {
+			if _, err := resolveUserIDString(c.Request.Context(), entry.User); err != nil {
 				c.JSON(http.StatusBadGateway, response{Code: requestHeadscaleError, Message: fmt.Sprintf("ensure Headscale user %q: %v", entry.User, err)})
 				return
 			}
@@ -182,7 +190,7 @@ func putApplicationPorts(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
 			return
 		}
-		updatedAt, err := setHeadscalePolicy(string(encoded))
+		updatedAt, err := setHeadscalePolicy(c.Request.Context(), string(encoded))
 		if err != nil {
 			c.JSON(http.StatusBadGateway, response{Code: requestHeadscaleError, Message: err.Error()})
 			return
@@ -199,13 +207,13 @@ func putApplicationPorts(c *gin.Context) {
 	c.JSON(http.StatusOK, response{Code: 0, Message: "", Data: current})
 }
 
-func readApplicationPorts() (applicationPortsState, error) {
-	state, _, err := loadApplicationPorts()
+func readApplicationPorts(ctx context.Context) (applicationPortsState, error) {
+	state, _, err := loadApplicationPorts(ctx)
 	return state, err
 }
 
-func loadApplicationPorts() (applicationPortsState, *policyDocument, error) {
-	policy, err := getHeadscalePolicy()
+func loadApplicationPorts(ctx context.Context) (applicationPortsState, *policyDocument, error) {
+	policy, err := getHeadscalePolicy(ctx)
 	if err != nil {
 		return applicationPortsState{}, nil, err
 	}
@@ -229,9 +237,9 @@ func loadApplicationPorts() (applicationPortsState, *policyDocument, error) {
 	}, document, nil
 }
 
-func getHeadscalePolicy() (headscalePolicyResponse, error) {
+func getHeadscalePolicy(ctx context.Context) (headscalePolicyResponse, error) {
 	var result headscalePolicyResponse
-	resp, err := resty.New().SetTimeout(10 * time.Second).R().
+	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetContext(ctx).
 		SetHeaders(headers).
 		SetResult(&result).
 		Get(url + "/policy")
@@ -247,9 +255,9 @@ func getHeadscalePolicy() (headscalePolicyResponse, error) {
 	return result, nil
 }
 
-func setHeadscalePolicy(policy string) (string, error) {
+func setHeadscalePolicy(ctx context.Context, policy string) (string, error) {
 	var result headscalePolicyResponse
-	resp, err := resty.New().SetTimeout(10 * time.Second).R().
+	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetContext(ctx).
 		SetHeaders(headers).
 		SetBody(map[string]string{"policy": policy}).
 		SetResult(&result).

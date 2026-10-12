@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,7 +9,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -56,7 +56,6 @@ var preauthkeyStr string = "/preauthkey"
 var getMachineStr string = "/node"
 var removeMachineStr string = "/node/:machineId"
 var renameMachineStr string = "/node/:machineId/rename/:newName"
-var routeEnableStr string = "/node/approve_routes"
 
 var apiKey string
 var host string
@@ -66,8 +65,6 @@ var config string
 
 var headers map[string]string
 var proxyPrefix string = "/headscale"
-
-var policyUpdateMu sync.Mutex
 
 const authenticatedUserContextKey = "authenticated-user"
 
@@ -141,7 +138,7 @@ func main() {
 				return
 			}
 
-			uid, err := resolveUserIDString(username)
+			uid, err := resolveUserIDString(c.Request.Context(), username)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, response{
 					Code:    requestHeadscaleError,
@@ -186,9 +183,17 @@ func main() {
 
 	rgProxy := router.Group(proxyPrefix)
 	rgProxy.Use(requireAuthenticatedUser())
+	rgProxy.GET("/olares-users", requireOwnerFor("list Olares users"), getOlaresUsers)
+	rgProxy.GET("/policy/lan-groups", requireOwnerFor("manage LAN groups"), getLanGroups)
+	rgProxy.PUT("/policy/lan-groups/:name", requireOwnerFor("manage LAN groups"), putLanGroup)
+	rgProxy.DELETE("/policy/lan-groups/:name", requireOwnerFor("manage LAN groups"), deleteLanGroup)
 	rgProxy.GET("/policy/exit-users", requireOwner(), getExitUsers)
 	rgProxy.PUT("/policy/exit-users/:username", requireOwner(), grantExitUser)
 	rgProxy.DELETE("/policy/exit-users/:username", requireOwner(), revokeExitUser)
+	rgProxy.GET("/policy/subnet-router/routes", requireOwnerFor("manage subnet routes"), getSubnetRoutes)
+	rgProxy.PUT("/policy/subnet-router/routes", requireOwnerFor("manage subnet routes"), putSubnetRoutes)
+	rgProxy.GET("/policy/subnet-router/access", requireOwnerFor("manage subnet access"), getSubnetAccess)
+	rgProxy.PUT("/policy/subnet-router/access", requireOwnerFor("manage subnet access"), putSubnetAccess)
 	rgProxy.POST(getMachineStr, func(c *gin.Context) {
 		var req struct {
 			ID string `json:"id,omitempty"`
@@ -260,46 +265,16 @@ func main() {
 		})
 	})
 
-	rgProxy.POST(routeEnableStr, func(c *gin.Context) {
-		var req struct {
-			ID     string   `json:"id" binding:"required"`
-			Routes []string `json:"routes"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-		if !requireOwnedNode(c, req.ID) {
-			return
-		}
-		result, err := routeEnable(req.ID, req.Routes)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-		c.JSON(http.StatusOK, response{
-			Code:    0,
-			Message: "",
-			Data:    result,
-		})
-	})
-
 	router.Run(":8000")
 }
 
-func resolveUserIDString(username string) (string, error) {
-	return resolveUserIDStringWithCreate(username, true)
+func resolveUserIDString(ctx context.Context, username string) (string, error) {
+	return resolveUserIDStringWithCreate(ctx, username, true)
 }
 
-func resolveUserIDStringWithCreate(username string, createIfMissing bool) (string, error) {
+func resolveUserIDStringWithCreate(ctx context.Context, username string, createIfMissing bool) (string, error) {
 	var parsed listUsersAPIResponse
-	resp, err := resty.New().R().SetHeaders(headers).
+	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetContext(ctx).SetHeaders(headers).
 		SetResult(&parsed).
 		Get(url + "/user")
 	if err != nil {
@@ -324,13 +299,13 @@ func resolveUserIDStringWithCreate(username string, createIfMissing bool) (strin
 		return "", fmt.Errorf("user %q was created but could not be found", username)
 	}
 
-	resp, createErr := resty.New().R().SetHeaders(headers).
+	resp, createErr := resty.New().SetTimeout(downstreamTimeout).R().SetContext(ctx).SetHeaders(headers).
 		SetBody(map[string]string{"name": username}).
 		Post(url + "/user")
 
 	// Another concurrent request may have created the user first. Treat the
 	// create operation as idempotent and use Headscale as the source of truth.
-	uid, lookupErr := resolveUserIDStringWithCreate(username, false)
+	uid, lookupErr := resolveUserIDStringWithCreate(ctx, username, false)
 	if lookupErr == nil {
 		return uid, nil
 	}
@@ -345,7 +320,7 @@ func resolveUserIDStringWithCreate(username string, createIfMissing bool) (strin
 
 func createPreAuthKey(data *createPreAuthKeyRequest, urlSuffix string) (interface{}, error) {
 	var result interface{}
-	resp, err := resty.New().R().SetHeaders(headers).
+	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetHeaders(headers).
 		SetBody(data).
 		SetResult(&result).
 		Post(url + urlSuffix)
@@ -362,7 +337,7 @@ func createPreAuthKey(data *createPreAuthKeyRequest, urlSuffix string) (interfac
 
 func listDevices() (listNodesAPIResponse, error) {
 	var result listNodesAPIResponse
-	resp, err := resty.New().R().SetHeaders(headers).
+	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetHeaders(headers).
 		SetResult(&result).
 		Get(url + getMachineStr)
 	if err != nil {
@@ -418,7 +393,7 @@ func userOwnsNode(username, nodeID string) (bool, error) {
 
 func removeDevice(urlSuffix string) (interface{}, error) {
 	var result interface{}
-	resp, err := resty.New().R().SetHeaders(headers).
+	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetHeaders(headers).
 		SetResult(&result).
 		Delete(url + urlSuffix)
 	if err != nil {
@@ -434,7 +409,7 @@ func removeDevice(urlSuffix string) (interface{}, error) {
 
 func renameDevice(urlSuffix string) (interface{}, error) {
 	var result interface{}
-	resp, err := resty.New().R().SetHeaders(headers).
+	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetHeaders(headers).
 		SetResult(&result).
 		Post(url + urlSuffix)
 	if err != nil {
@@ -443,27 +418,6 @@ func renameDevice(urlSuffix string) (interface{}, error) {
 
 	if resp.StatusCode() != 200 {
 		return nil, fmt.Errorf("renameDevice failed, data: %s", resp.String())
-	}
-
-	return result, nil
-}
-
-func routeEnable(nodeID string, routes []string) (interface{}, error) {
-	var result interface{}
-	body := map[string][]string{"routes": routes}
-	if routes == nil {
-		body["routes"] = []string{}
-	}
-	resp, err := resty.New().R().SetHeaders(headers).
-		SetBody(body).
-		SetResult(&result).
-		Post(url + "/node/" + nodeID + "/approve_routes")
-	if err != nil {
-		return nil, fmt.Errorf("routeEnable failed, err: %s, data: %s", err, resp.String())
-	}
-
-	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("routeEnable failed, data: %s", resp.String())
 	}
 
 	return result, nil
