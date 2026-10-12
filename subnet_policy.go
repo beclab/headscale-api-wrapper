@@ -16,6 +16,7 @@ import (
 )
 
 const subnetAccessGroupPrefix = "group:subnet-access-"
+const subnetAccessOwner = "olares-subnet-access"
 const subnetMarker = "10.255.255.254/32"
 
 type subnetAccessRule struct {
@@ -265,6 +266,11 @@ func managedSubnetGroup(s string) bool {
 	return s == subnetUsersGroup || strings.HasPrefix(s, subnetAccessGroupPrefix)
 }
 
+func markedSubnetACL(acl policyACL) bool {
+	var owner string
+	return json.Unmarshal(acl.fields["#managed-by"], &owner) == nil && owner == subnetAccessOwner
+}
+
 // Read legacy broad rules too, so a caller can inspect them before replacing
 // them. An empty protocol in a legacy response means the old all-protocol rule.
 func (p *policyDocument) subnetAccess() ([]subnetAccessRule, error) {
@@ -274,7 +280,7 @@ func (p *policyDocument) subnetAccess() ([]subnetAccessRule, error) {
 	}
 	result := []subnetAccessRule{}
 	for _, acl := range p.ACLs {
-		managed := false
+		managed := markedSubnetACL(acl)
 		for _, src := range acl.Src {
 			managed = managed || managedSubnetGroup(src)
 		}
@@ -285,23 +291,28 @@ func (p *policyDocument) subnetAccess() ([]subnetAccessRule, error) {
 			return nil, errors.New("unexpected managed subnet ACL")
 		}
 		for key := range acl.fields {
-			if key != "action" && key != "src" && key != "dst" && key != "proto" {
+			if key != "action" && key != "src" && key != "dst" && key != "proto" && !strings.HasPrefix(key, "#") {
 				return nil, fmt.Errorf("unsupported managed subnet ACL field %s", key)
 			}
 		}
-		members, ok := groups[acl.Src[0]]
-		if !ok {
-			return nil, errors.New("missing subnet access group")
-		}
-		users, err := normalizeSubnetUserAliases(members)
-		if err != nil {
-			return nil, err
+		users := []string{}
+		sources := acl.Src
+		if !markedSubnetACL(acl) {
+			if !managedSubnetGroup(acl.Src[0]) {
+				return nil, errors.New("invalid subnet marker position")
+			}
+			members, ok := groups[acl.Src[0]]
+			if !ok {
+				return nil, errors.New("missing subnet access group")
+			}
+			users, err = normalizeSubnetUserAliases(members)
+			if err != nil {
+				return nil, err
+			}
+			sources = acl.Src[1:]
 		}
 		refs := []string(nil)
-		if !managedSubnetGroup(acl.Src[0]) {
-			return nil, errors.New("invalid subnet marker position")
-		}
-		for _, src := range acl.Src[1:] {
+		for _, src := range sources {
 			if strings.HasPrefix(src, lanGroupPrefix) {
 				name := strings.TrimPrefix(src, lanGroupPrefix)
 				if !lanGroupName.MatchString(name) {
@@ -351,22 +362,21 @@ func (p *policyDocument) replaceSubnetAccess(rules []subnetAccessRule) error {
 	}
 	retained := []policyACL{}
 	for _, acl := range p.ACLs {
-		if len(acl.Src) > 0 && managedSubnetGroup(acl.Src[0]) {
+		if markedSubnetACL(acl) || (len(acl.Src) > 0 && managedSubnetGroup(acl.Src[0])) {
 			continue
 		}
 		retained = append(retained, acl)
 	}
-	for i, r := range rules {
-		group := fmt.Sprintf("%s%d", subnetAccessGroupPrefix, i)
-		groups[group] = []string{} // Empty ownership marker; never grants access.
-		sources := append([]string{group}, policyUserAliases(r.Users)...)
+	for _, r := range rules {
+		sources := policyUserAliases(r.Users)
 		for _, name := range r.Groups {
 			if _, ok := groups[lanGroupPrefix+name]; !ok {
 				return fmt.Errorf("LAN group %q does not exist", name)
 			}
 			sources = append(sources, lanGroupPrefix+name)
 		}
-		retained = append(retained, policyACL{Action: "accept", Src: sources, Proto: r.Protocol, Dst: []string{r.Target + ":" + strings.Join(r.Ports, ",")}})
+		owner, _ := json.Marshal(subnetAccessOwner)
+		retained = append(retained, policyACL{fields: map[string]json.RawMessage{"#managed-by": owner}, Action: "accept", Src: sources, Proto: r.Protocol, Dst: []string{r.Target + ":" + strings.Join(r.Ports, ",")}})
 	}
 	raw, err := json.Marshal(groups)
 	if err != nil {
@@ -374,6 +384,24 @@ func (p *policyDocument) replaceSubnetAccess(rules []subnetAccessRule) error {
 	}
 	p.fields["groups"] = raw
 	p.ACLs = retained
+	// Remove obsolete marker groups only when no policy section references them.
+	raw, err = p.marshal()
+	if err != nil {
+		return err
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return err
+	}
+	for name := range groups {
+		if strings.HasPrefix(name, subnetAccessGroupPrefix) && !referencesGroup(doc, name) {
+			delete(groups, name)
+		}
+	}
+	p.fields["groups"], err = json.Marshal(groups)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
