@@ -183,6 +183,8 @@ func main() {
 
 	rgProxy := router.Group(proxyPrefix)
 	rgProxy.Use(requireAuthenticatedUser())
+	rgProxy.GET("/policy/self-mesh", getSelfMesh)
+	rgProxy.PUT("/policy/self-mesh", putSelfMesh)
 	rgProxy.GET("/olares-users", requireOwnerFor("list Olares users"), getOlaresUsers)
 	rgProxy.GET("/policy/lan-groups", requireOwnerFor("manage LAN groups"), getLanGroups)
 	rgProxy.PUT("/policy/lan-groups/:name", requireOwnerFor("manage LAN groups"), putLanGroup)
