@@ -180,6 +180,7 @@ func main() {
 	internal.Use(requireServiceAccount())
 	internal.GET("/policy/application-ports", getApplicationPorts)
 	internal.PUT("/policy/application-ports", putApplicationPorts)
+	registerBootstrap(router)
 
 	rgProxy := router.Group(proxyPrefix)
 	rgProxy.Use(requireAuthenticatedUser())

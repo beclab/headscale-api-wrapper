@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -48,6 +49,22 @@ type tokenReviewStatus struct {
 var reviewServiceAccountToken = kubernetesTokenReview
 
 func requireServiceAccount() gin.HandlerFunc {
+	expectedNS := strings.TrimSpace(os.Getenv("POLICY_CLIENT_NAMESPACE"))
+	if expectedNS == "" {
+		expectedNS = defaultServiceAuthNS
+	}
+	expectedSA := strings.TrimSpace(os.Getenv("POLICY_CLIENT_SERVICE_ACCOUNT"))
+	if expectedSA == "" {
+		expectedSA = defaultServiceAuthSA
+	}
+	audience := strings.TrimSpace(os.Getenv("POLICY_TOKEN_AUDIENCE"))
+	if audience == "" {
+		audience = defaultServiceAudience
+	}
+	return requireAllowedServiceAccount(fmt.Sprintf("system:serviceaccount:%s:%s", expectedNS, expectedSA), audience)
+}
+
+func requireAllowedServiceAccount(expectedUsername, audience string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authorization := strings.Fields(c.GetHeader("Authorization"))
 		if len(authorization) != 2 || !strings.EqualFold(authorization[0], "Bearer") || authorization[1] == "" {
@@ -56,23 +73,14 @@ func requireServiceAccount() gin.HandlerFunc {
 		}
 		token := authorization[1]
 
-		username, err := reviewServiceAccountToken(token)
+		username, err := reviewServiceAccountToken(c.Request.Context(), token, audience)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, response{Code: requestHeadscaleError, Message: err.Error()})
 			return
 		}
 
-		expectedNS := strings.TrimSpace(os.Getenv("POLICY_CLIENT_NAMESPACE"))
-		if expectedNS == "" {
-			expectedNS = defaultServiceAuthNS
-		}
-		expectedSA := strings.TrimSpace(os.Getenv("POLICY_CLIENT_SERVICE_ACCOUNT"))
-		if expectedSA == "" {
-			expectedSA = defaultServiceAuthSA
-		}
-		expectedUsername := fmt.Sprintf("system:serviceaccount:%s:%s", expectedNS, expectedSA)
 		if username != expectedUsername {
-			c.AbortWithStatusJSON(http.StatusForbidden, response{Code: requestHeadscaleError, Message: "service account is not allowed to manage Headscale policy"})
+			c.AbortWithStatusJSON(http.StatusForbidden, response{Code: requestHeadscaleError, Message: "service account is not allowed to access this endpoint"})
 			return
 		}
 
@@ -80,7 +88,7 @@ func requireServiceAccount() gin.HandlerFunc {
 	}
 }
 
-func kubernetesTokenReview(token string) (string, error) {
+func kubernetesTokenReview(ctx context.Context, token, audience string) (string, error) {
 	host := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
 	port := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_PORT"))
 	if host == "" || port == "" {
@@ -96,9 +104,8 @@ func kubernetesTokenReview(token string) (string, error) {
 		return "", errors.New("parse Kubernetes service account CA")
 	}
 
-	audience := strings.TrimSpace(os.Getenv("POLICY_TOKEN_AUDIENCE"))
 	if audience == "" {
-		audience = defaultServiceAudience
+		return "", errors.New("service account audience is required")
 	}
 	payload, err := json.Marshal(tokenReview{
 		APIVersion: "authentication.k8s.io/v1",
@@ -126,7 +133,7 @@ func kubernetesTokenReview(token string) (string, error) {
 			RootCAs:    roots,
 		}},
 	}
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("https://%s:%s/apis/authentication.k8s.io/v1/tokenreviews", host, port), bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://%s:%s/apis/authentication.k8s.io/v1/tokenreviews", host, port), bytes.NewReader(payload))
 	if err != nil {
 		return "", fmt.Errorf("create Kubernetes token review request: %w", err)
 	}
