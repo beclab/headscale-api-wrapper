@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 const (
 	requestHeadscaleError int = 1001
+	internalPolicyPort        = 8001
 )
 
 type response struct {
@@ -27,11 +29,11 @@ type response struct {
 }
 
 type createPreAuthKeyRequest struct {
-	User       string   `protobuf:"bytes,1,opt,name=user,proto3" json:"user,omitempty"`
-	Reusable   bool     `protobuf:"varint,2,opt,name=reusable,proto3" json:"reusable,omitempty"`
-	Ephemeral  bool     `protobuf:"varint,3,opt,name=ephemeral,proto3" json:"ephemeral,omitempty"`
-	Expiration string   `protobuf:"bytes,4,opt,name=expiration,proto3" json:"expiration,omitempty"`
-	AclTags    []string `protobuf:"bytes,5,rep,name=acl_tags,json=aclTags,proto3" json:"aclTags,omitempty"`
+	User       string   `json:"user,omitempty"`
+	Reusable   bool     `json:"reusable,omitempty"`
+	Ephemeral  bool     `json:"ephemeral,omitempty"`
+	Expiration string   `json:"expiration,omitempty"`
+	AclTags    []string `json:"aclTags,omitempty"`
 }
 
 type listUsersAPIResponse struct {
@@ -53,9 +55,8 @@ type nodeIdentity struct {
 }
 
 var preauthkeyStr string = "/preauthkey"
-var getMachineStr string = "/node"
-var removeMachineStr string = "/node/:machineId"
-var renameMachineStr string = "/node/:machineId/rename/:newName"
+
+const nodePath = "/node"
 
 var apiKey string
 var host string
@@ -67,6 +68,24 @@ var headers map[string]string
 var proxyPrefix string = "/headscale"
 
 const authenticatedUserContextKey = "authenticated-user"
+
+func restyResponseError(operation string, resp *resty.Response) error {
+	if resp == nil {
+		log.Printf("%s failed: empty response", operation)
+		return fmt.Errorf("%s failed: empty response", operation)
+	}
+	body := strings.TrimSpace(resp.String())
+	if len(body) > 512 {
+		body = body[:512]
+	}
+	log.Printf("%s failed status=%d body=%q", operation, resp.StatusCode(), body)
+	return fmt.Errorf("%s failed: status %d", operation, resp.StatusCode())
+}
+
+func restyRequestError(operation string, err error) error {
+	log.Printf("%s failed error=%v", operation, err)
+	return fmt.Errorf("%s failed: %w", operation, err)
+}
 
 func init() {
 	apiKey = os.Getenv("APIKEY")
@@ -102,7 +121,7 @@ func requireAuthenticatedUser() gin.HandlerFunc {
 
 func requireOwnedNode(c *gin.Context, nodeID string) bool {
 	username := c.GetString(authenticatedUserContextKey)
-	owned, err := userOwnsNode(username, nodeID)
+	owned, err := userOwnsNode(c.Request.Context(), username, nodeID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, response{
 			Code:    requestHeadscaleError,
@@ -152,9 +171,7 @@ func main() {
 				Ephemeral:  false,
 				Expiration: time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
 			}
-			fmt.Println(data)
-
-			resp, err := createPreAuthKey(&data, preauthkeyStr)
+			resp, err := createPreAuthKey(c.Request.Context(), &data, preauthkeyStr)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, response{
 					Code:    requestHeadscaleError,
@@ -167,19 +184,20 @@ func main() {
 				Message: "",
 				Data:    resp,
 			})
+			logMutation(c, "preauthkey.create", true, fmt.Sprintf("username=%q", username))
 		})
 
-		go router.Run(":9000")
+		go func() {
+			if err := router.Run(":9000"); err != nil {
+				log.Fatalf("preauthkey server failed: %v", err)
+			}
+		}()
 	}
 
 	// gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 	router.SetTrustedProxies(nil)
 
-	internal := router.Group("/internal")
-	internal.Use(requireServiceAccount())
-	internal.GET("/policy/application-ports", getApplicationPorts)
-	internal.PUT("/policy/application-ports", putApplicationPorts)
 	registerBootstrap(router)
 
 	rgProxy := router.Group(proxyPrefix)
@@ -197,35 +215,8 @@ func main() {
 	rgProxy.PUT("/policy/subnet-router/routes", requireOwnerFor("manage subnet routes"), putSubnetRoutes)
 	rgProxy.GET("/policy/subnet-router/access", requireOwnerFor("manage subnet access"), getSubnetAccess)
 	rgProxy.PUT("/policy/subnet-router/access", requireOwnerFor("manage subnet access"), putSubnetAccess)
-	rgProxy.POST(getMachineStr, func(c *gin.Context) {
-		var req struct {
-			ID string `json:"id,omitempty"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, response{
-				Code:    requestHeadscaleError,
-				Message: err.Error(),
-			})
-			return
-		}
-
-		if req.ID != "" {
-			if !requireOwnedNode(c, req.ID) {
-				return
-			}
-			machines, err := removeDevice(strings.Replace(removeMachineStr, ":machineId", req.ID, 1))
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, response{
-					Code:    requestHeadscaleError,
-					Message: err.Error(),
-				})
-				return
-			}
-			c.JSON(http.StatusOK, response{Code: 0, Message: "", Data: machines})
-			return
-		}
-
-		machines, err := getDevicesForUser(c.GetString(authenticatedUserContextKey))
+	rgProxy.GET(nodePath, func(c *gin.Context) {
+		machines, err := getDevicesForUser(c.Request.Context(), c.GetString(authenticatedUserContextKey))
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, response{
 				Code:    requestHeadscaleError,
@@ -240,20 +231,17 @@ func main() {
 		})
 	})
 
-	rgProxy.POST("/node/rename", func(c *gin.Context) {
-		var req struct {
-			ID   string `json:"id" binding:"required"`
-			Name string `json:"name" binding:"required"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: err.Error()})
+	rgProxy.DELETE(nodePath+"/:nodeID", func(c *gin.Context) {
+		nodeID := strings.TrimSpace(c.Param("nodeID"))
+		if nodeID == "" {
+			c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: "node ID is required"})
 			return
 		}
-		if !requireOwnedNode(c, req.ID) {
+		if !requireOwnedNode(c, nodeID) {
 			return
 		}
 
-		machines, err := renameDevice(strings.Replace(strings.Replace(renameMachineStr, ":machineId", req.ID, 1), ":newName", req.Name, 1))
+		machines, err := removeDevice(c.Request.Context(), nodeID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, response{
 				Code:    requestHeadscaleError,
@@ -261,14 +249,56 @@ func main() {
 			})
 			return
 		}
-		c.JSON(http.StatusOK, response{
-			Code:    0,
-			Message: "",
-			Data:    machines,
-		})
+		c.JSON(http.StatusOK, response{Code: 0, Message: "", Data: machines})
+		logMutation(c, "node.delete", true, fmt.Sprintf("nodeID=%q", nodeID))
 	})
 
-	router.Run(":8000")
+	rgProxy.PATCH(nodePath+"/:nodeID", func(c *gin.Context) {
+		nodeID := strings.TrimSpace(c.Param("nodeID"))
+		if nodeID == "" {
+			c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: "node ID is required"})
+			return
+		}
+		var req struct {
+			Name string `json:"name"`
+		}
+		if !bindJSON(c, &req, 4096) {
+			return
+		}
+		name := strings.TrimSpace(req.Name)
+		if name == "" {
+			c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: "name is required"})
+			return
+		}
+		if !requireOwnedNode(c, nodeID) {
+			return
+		}
+
+		machines, err := renameDevice(c.Request.Context(), nodeID, name)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, response{
+				Code:    requestHeadscaleError,
+				Message: err.Error(),
+			})
+			return
+		}
+		c.JSON(http.StatusOK, response{Code: 0, Message: "", Data: machines})
+		logMutation(c, "node.rename", true, fmt.Sprintf("nodeID=%q", nodeID))
+	})
+
+	policyRouter := gin.Default()
+	policyRouter.SetTrustedProxies(nil)
+	policyRouter.GET("/internal/policy/application-ports", getApplicationPorts)
+	policyRouter.PUT("/internal/policy/application-ports", putApplicationPorts)
+	go func() {
+		if err := policyRouter.Run(fmt.Sprintf(":%d", internalPolicyPort)); err != nil {
+			log.Fatalf("application policy server failed: %v", err)
+		}
+	}()
+
+	if err := router.Run(":8000"); err != nil {
+		log.Fatalf("API server failed: %v", err)
+	}
 }
 
 func resolveUserIDString(ctx context.Context, username string) (string, error) {
@@ -281,10 +311,10 @@ func resolveUserIDStringWithCreate(ctx context.Context, username string, createI
 		SetResult(&parsed).
 		Get(url + "/user")
 	if err != nil {
-		return "", fmt.Errorf("list users failed, err: %s, data: %s", err, resp.String())
+		return "", restyRequestError("list users", err)
 	}
-	if resp.StatusCode() != 200 {
-		return "", fmt.Errorf("list users failed, data: %s", resp.String())
+	if resp == nil || resp.StatusCode() != 200 {
+		return "", restyResponseError("list users", resp)
 	}
 	for _, u := range parsed.Users {
 		if u.Name == username {
@@ -313,49 +343,49 @@ func resolveUserIDStringWithCreate(ctx context.Context, username string, createI
 		return uid, nil
 	}
 	if createErr != nil {
-		return "", fmt.Errorf("create user failed, err: %s", createErr)
+		return "", restyRequestError("create user", createErr)
 	}
-	if resp.StatusCode() != http.StatusOK && resp.StatusCode() != http.StatusCreated {
-		return "", fmt.Errorf("create user failed, data: %s", resp.String())
+	if resp == nil || (resp.StatusCode() != http.StatusOK && resp.StatusCode() != http.StatusCreated) {
+		return "", restyResponseError("create user", resp)
 	}
 	return "", lookupErr
 }
 
-func createPreAuthKey(data *createPreAuthKeyRequest, urlSuffix string) (interface{}, error) {
+func createPreAuthKey(ctx context.Context, data *createPreAuthKeyRequest, urlSuffix string) (interface{}, error) {
 	var result interface{}
-	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetHeaders(headers).
+	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetContext(ctx).SetHeaders(headers).
 		SetBody(data).
 		SetResult(&result).
 		Post(url + urlSuffix)
 	if err != nil {
-		return nil, fmt.Errorf("createPreAuthKey failed, err: %s, data: %s", err, resp.String())
+		return nil, restyRequestError("createPreAuthKey", err)
 	}
 
-	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("createPreAuthKey failed, data: %s", resp.String())
+	if resp == nil || resp.StatusCode() != 200 {
+		return nil, restyResponseError("createPreAuthKey", resp)
 	}
 
 	return result, nil
 }
 
-func listDevices() (listNodesAPIResponse, error) {
+func listDevices(ctx context.Context) (listNodesAPIResponse, error) {
 	var result listNodesAPIResponse
-	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetHeaders(headers).
+	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetContext(ctx).SetHeaders(headers).
 		SetResult(&result).
-		Get(url + getMachineStr)
+		Get(url + nodePath)
 	if err != nil {
-		return listNodesAPIResponse{}, fmt.Errorf("getDevices failed, err: %s, data: %s", err, resp.String())
+		return listNodesAPIResponse{}, restyRequestError("getDevices", err)
 	}
 
-	if resp.StatusCode() != 200 {
-		return listNodesAPIResponse{}, fmt.Errorf("getDevices failed, data: %s", resp.String())
+	if resp == nil || resp.StatusCode() != 200 {
+		return listNodesAPIResponse{}, restyResponseError("getDevices", resp)
 	}
 
 	return result, nil
 }
 
-func getDevicesForUser(username string) (listNodesAPIResponse, error) {
-	result, err := listDevices()
+func getDevicesForUser(ctx context.Context, username string) (listNodesAPIResponse, error) {
+	result, err := listDevices(ctx)
 	if err != nil {
 		return listNodesAPIResponse{}, err
 	}
@@ -375,8 +405,8 @@ func getDevicesForUser(username string) (listNodesAPIResponse, error) {
 	return result, nil
 }
 
-func userOwnsNode(username, nodeID string) (bool, error) {
-	result, err := listDevices()
+func userOwnsNode(ctx context.Context, username, nodeID string) (bool, error) {
+	result, err := listDevices(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -394,33 +424,33 @@ func userOwnsNode(username, nodeID string) (bool, error) {
 	return false, nil
 }
 
-func removeDevice(urlSuffix string) (interface{}, error) {
+func removeDevice(ctx context.Context, nodeID string) (interface{}, error) {
 	var result interface{}
-	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetHeaders(headers).
+	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetContext(ctx).SetHeaders(headers).
 		SetResult(&result).
-		Delete(url + urlSuffix)
+		Delete(url + "/node/" + neturl.PathEscape(nodeID))
 	if err != nil {
-		return nil, fmt.Errorf("removeDevice failed, err: %s, data: %s", err, resp.String())
+		return nil, restyRequestError("removeDevice", err)
 	}
 
-	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("removeDevice failed, data: %s", resp.String())
+	if resp == nil || resp.StatusCode() != 200 {
+		return nil, restyResponseError("removeDevice", resp)
 	}
 
 	return result, nil
 }
 
-func renameDevice(urlSuffix string) (interface{}, error) {
+func renameDevice(ctx context.Context, nodeID, name string) (interface{}, error) {
 	var result interface{}
-	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetHeaders(headers).
+	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetContext(ctx).SetHeaders(headers).
 		SetResult(&result).
-		Post(url + urlSuffix)
+		Post(url + "/node/" + neturl.PathEscape(nodeID) + "/rename/" + neturl.PathEscape(name))
 	if err != nil {
-		return nil, fmt.Errorf("renameDevice failed, err: %s, data: %s", err, resp.String())
+		return nil, restyRequestError("renameDevice", err)
 	}
 
-	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("renameDevice failed, data: %s", resp.String())
+	if resp == nil || resp.StatusCode() != 200 {
+		return nil, restyResponseError("renameDevice", resp)
 	}
 
 	return result, nil

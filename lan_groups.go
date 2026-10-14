@@ -106,7 +106,7 @@ func getLanGroups(c *gin.Context) {
 	}
 	groups, err := p.lanGroups()
 	if err != nil {
-		writeSubnetRouterError(c, err)
+		writeSubnetRouterError(c, &policyShapeError{err: err})
 		return
 	}
 	c.JSON(200, response{Data: gin.H{"groups": groups}})
@@ -122,7 +122,7 @@ func putLanGroup(c *gin.Context) {
 	var req struct {
 		Users *[]string `json:"users"`
 	}
-	if !bindSubnetRequest(c, &req) {
+	if !bindJSON(c, &req, 1<<20) {
 		return
 	}
 	if req.Users == nil {
@@ -149,7 +149,7 @@ func putLanGroup(c *gin.Context) {
 	}
 	groups, err := p.policyGroups()
 	if err != nil {
-		writeSubnetRouterError(c, err)
+		writeSubnetRouterError(c, &policyShapeError{err: err})
 		return
 	}
 	aliases := policyUserAliases(users)
@@ -169,6 +169,7 @@ func putLanGroup(c *gin.Context) {
 		}
 	}
 	c.JSON(200, response{Data: gin.H{"name": name, "users": users, "changed": changed}})
+	logMutation(c, "lan-group.put", changed, fmt.Sprintf("group=%q users=%d", name, len(users)))
 }
 func deleteLanGroup(c *gin.Context) {
 	cancel := beginPolicyOperation(c)
@@ -189,7 +190,7 @@ func deleteLanGroup(c *gin.Context) {
 	}
 	groups, err := p.policyGroups()
 	if err != nil {
-		writeSubnetRouterError(c, err)
+		writeSubnetRouterError(c, &policyShapeError{err: err})
 		return
 	}
 	key := lanGroupPrefix + name
@@ -200,7 +201,10 @@ func deleteLanGroup(c *gin.Context) {
 		return
 	}
 	var doc map[string]any
-	json.Unmarshal(raw, &doc)
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		writeSubnetRouterError(c, &policyShapeError{err: fmt.Errorf("decode Headscale policy: %w", err)})
+		return
+	}
 	if g, ok := doc["groups"].(map[string]any); ok {
 		delete(g, key)
 	}
@@ -218,6 +222,7 @@ func deleteLanGroup(c *gin.Context) {
 		}
 	}
 	c.JSON(200, response{Data: gin.H{"changed": changed}})
+	logMutation(c, "lan-group.delete", changed, fmt.Sprintf("group=%q", name))
 }
 func referencesGroup(v any, key string) bool {
 	switch x := v.(type) {

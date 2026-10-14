@@ -20,9 +20,6 @@ import (
 const (
 	serviceAccountCAPath    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	serviceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-	defaultServiceAuthNS    = "os-framework"
-	defaultServiceAuthSA    = "os-internal"
-	defaultServiceAudience  = "headscale-policy"
 )
 
 type tokenReview struct {
@@ -47,22 +44,6 @@ type tokenReviewStatus struct {
 }
 
 var reviewServiceAccountToken = kubernetesTokenReview
-
-func requireServiceAccount() gin.HandlerFunc {
-	expectedNS := strings.TrimSpace(os.Getenv("POLICY_CLIENT_NAMESPACE"))
-	if expectedNS == "" {
-		expectedNS = defaultServiceAuthNS
-	}
-	expectedSA := strings.TrimSpace(os.Getenv("POLICY_CLIENT_SERVICE_ACCOUNT"))
-	if expectedSA == "" {
-		expectedSA = defaultServiceAuthSA
-	}
-	audience := strings.TrimSpace(os.Getenv("POLICY_TOKEN_AUDIENCE"))
-	if audience == "" {
-		audience = defaultServiceAudience
-	}
-	return requireAllowedServiceAccount(fmt.Sprintf("system:serviceaccount:%s:%s", expectedNS, expectedSA), audience)
-}
 
 func requireAllowedServiceAccount(expectedUsername, audience string) gin.HandlerFunc {
 	return func(c *gin.Context) {

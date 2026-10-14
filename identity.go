@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,7 +32,7 @@ func authenticatedUser(r *http.Request) (string, error) {
 		return "", errors.New("missing X-Authorization header")
 	}
 
-	claims, err := verifySessionToken(token)
+	claims, err := verifySessionToken(r.Context(), token)
 	if err != nil {
 		return "", err
 	}
@@ -46,12 +47,12 @@ func authenticatedUser(r *http.Request) (string, error) {
 	return username, nil
 }
 
-func verifyOlaresSessionToken(token string) (tokenClaims, error) {
+func verifyOlaresSessionToken(ctx context.Context, token string) (tokenClaims, error) {
 	verifyURL := strings.TrimSpace(os.Getenv("TOKEN_VERIFY_URL"))
 	if verifyURL == "" {
 		verifyURL = defaultTokenVerifyURL
 	}
-	resp, err := resty.New().SetTimeout(10*time.Second).R().
+	resp, err := resty.New().SetTimeout(10*time.Second).R().SetContext(ctx).
 		SetHeader("Content-Type", "application/json").
 		SetAuthToken(token).
 		SetBody(map[string]string{"access_token": token}).

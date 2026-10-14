@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -14,7 +13,7 @@ const selfMeshGroup = "group:self-mesh"
 
 type selfMeshState struct {
 	Enabled bool `json:"enabled"`
-	Changed bool `json:"changed"`
+	Changed bool `json:"changed,omitempty"`
 }
 
 func getSelfMesh(c *gin.Context) { handleSelfMesh(c, false) }
@@ -30,13 +29,10 @@ func handleSelfMesh(c *gin.Context, update bool) {
 		Enabled *bool `json:"enabled"`
 	}
 	if update {
-		decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 4096))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&request); err != nil {
-			c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: err.Error()})
+		if !bindJSON(c, &request, 4096) {
 			return
 		}
-		if err := decoder.Decode(new(interface{})); err != io.EOF || request.Enabled == nil {
+		if request.Enabled == nil {
 			c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: "body must contain a boolean enabled field only"})
 			return
 		}
@@ -85,13 +81,16 @@ func handleSelfMesh(c *gin.Context, update bool) {
 			c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
 			return
 		}
-		if _, err := setHeadscalePolicy(c.Request.Context(), string(encoded)); err != nil {
+		if err := setHeadscalePolicy(c.Request.Context(), string(encoded)); err != nil {
 			writeExitUsersError(c, err)
 			return
 		}
 		state.Enabled, state.Changed = *request.Enabled, true
 	}
 	c.JSON(http.StatusOK, response{Code: 0, Message: "", Data: state})
+	if update {
+		logMutation(c, "self-mesh.put", state.Changed, fmt.Sprintf("enabled=%t", state.Enabled))
+	}
 }
 
 // Only manage membership of the preinstalled self-only rule. Never silently

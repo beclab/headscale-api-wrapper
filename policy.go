@@ -1,9 +1,8 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,11 +16,6 @@ import (
 	resty "github.com/go-resty/resty/v2"
 	"github.com/tailscale/hujson"
 )
-
-var defaultApplicationServicePorts = protocolPorts{
-	TCP: []string{"53", "80", "443", "18088"},
-	UDP: []string{"53"},
-}
 
 type protocolPorts struct {
 	TCP []string `json:"tcp"`
@@ -38,18 +32,11 @@ type applicationPortsRequest struct {
 }
 
 type applicationPortsState struct {
-	DefaultPorts     protocolPorts       `json:"defaultPorts"`
 	ApplicationPorts []userProtocolPorts `json:"applicationPorts"`
-	EffectivePorts   []userProtocolPorts `json:"effectivePorts"`
-	Revision         string              `json:"revision"`
-	UpdatedAt        string              `json:"updatedAt,omitempty"`
-	InSync           bool                `json:"inSync"`
-	Changed          bool                `json:"changed,omitempty"`
 }
 
 type headscalePolicyResponse struct {
-	Policy    string `json:"policy"`
-	UpdatedAt string `json:"updatedAt"`
+	Policy string `json:"policy"`
 }
 
 // policyACL retains unknown fields so upgrading Headscale cannot cause a
@@ -140,8 +127,7 @@ func putApplicationPorts(c *gin.Context) {
 	cancel := beginPolicyOperation(c)
 	defer cancel()
 	var request applicationPortsRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: err.Error()})
+	if !bindJSON(c, &request, 1<<20) {
 		return
 	}
 	if request.ApplicationPorts == nil {
@@ -157,20 +143,34 @@ func putApplicationPorts(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: err.Error()})
 		return
 	}
-	requested = subtractUserDefaultPorts(requested, defaultApplicationServicePorts)
-
 	if !lockPolicy(c) {
 		return
 	}
 	defer unlockPolicy()
 
-	current, document, err := loadApplicationPorts(c.Request.Context())
+	policy, err := getHeadscalePolicy(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
+		return
+	}
+	document, err := parsePolicyDocument([]byte(policy.Policy))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
 		return
 	}
 
-	changed := !current.InSync || !userProtocolPortsEqual(current.ApplicationPorts, requested)
+	before, err := document.marshal()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
+		return
+	}
+	document.setManagedApplicationPorts(requested)
+	after, err := document.marshal()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
+		return
+	}
+	changed := !bytes.Equal(before, after)
 	if changed {
 		// Headscale resolves user aliases while validating the policy. Ensure each
 		// real Olares owner has a corresponding Headscale user before referencing
@@ -181,60 +181,33 @@ func putApplicationPorts(c *gin.Context) {
 				return
 			}
 		}
-		if err := document.setManagedApplicationPorts(defaultApplicationServicePorts, requested); err != nil {
-			c.JSON(http.StatusConflict, response{Code: requestHeadscaleError, Message: err.Error()})
-			return
-		}
-		encoded, err := document.marshal()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
-			return
-		}
-		updatedAt, err := setHeadscalePolicy(c.Request.Context(), string(encoded))
+		err = setHeadscalePolicy(c.Request.Context(), string(after))
 		if err != nil {
 			c.JSON(http.StatusBadGateway, response{Code: requestHeadscaleError, Message: err.Error()})
 			return
 		}
-		current.UpdatedAt = updatedAt
 	}
 
-	current.DefaultPorts = cloneProtocolPorts(defaultApplicationServicePorts)
-	current.ApplicationPorts = requested
-	current.EffectivePorts = effectiveUserPorts(current.DefaultPorts, requested)
-	current.Revision = userProtocolPortsRevision(requested)
-	current.InSync = true
-	current.Changed = changed
-	c.JSON(http.StatusOK, response{Code: 0, Message: "", Data: current})
+	c.JSON(http.StatusOK, response{Code: 0, Message: "", Data: struct{}{}})
+	logMutation(c, "application-ports.put", changed, fmt.Sprintf("users=%d", len(requested)))
 }
 
 func readApplicationPorts(ctx context.Context) (applicationPortsState, error) {
-	state, _, err := loadApplicationPorts(ctx)
-	return state, err
-}
-
-func loadApplicationPorts(ctx context.Context) (applicationPortsState, *policyDocument, error) {
 	policy, err := getHeadscalePolicy(ctx)
 	if err != nil {
-		return applicationPortsState{}, nil, err
+		return applicationPortsState{}, err
 	}
 	document, err := parsePolicyDocument([]byte(policy.Policy))
 	if err != nil {
-		return applicationPortsState{}, nil, err
+		return applicationPortsState{}, err
 	}
-	policyDefaults, application, err := document.managedApplicationPorts()
+	application, err := document.managedApplicationPorts()
 	if err != nil {
-		return applicationPortsState{}, nil, err
+		return applicationPortsState{}, err
 	}
-	defaults := cloneProtocolPorts(defaultApplicationServicePorts)
 	return applicationPortsState{
-		DefaultPorts:     defaults,
 		ApplicationPorts: application,
-		EffectivePorts:   effectiveUserPorts(defaults, application),
-		Revision:         userProtocolPortsRevision(application),
-		UpdatedAt:        policy.UpdatedAt,
-		InSync: protocolPortsEqual(policyDefaults, defaults) &&
-			document.applicationRulesCanonical(application),
-	}, document, nil
+	}, nil
 }
 
 func getHeadscalePolicy(ctx context.Context) (headscalePolicyResponse, error) {
@@ -244,10 +217,10 @@ func getHeadscalePolicy(ctx context.Context) (headscalePolicyResponse, error) {
 		SetResult(&result).
 		Get(url + "/policy")
 	if err != nil {
-		return result, fmt.Errorf("get Headscale policy: %w", err)
+		return result, restyRequestError("get Headscale policy", err)
 	}
-	if resp.StatusCode() != http.StatusOK {
-		return result, fmt.Errorf("get Headscale policy: status %d: %s", resp.StatusCode(), resp.String())
+	if resp == nil || resp.StatusCode() != http.StatusOK {
+		return result, restyResponseError("get Headscale policy", resp)
 	}
 	if strings.TrimSpace(result.Policy) == "" {
 		return result, errors.New("Headscale returned an empty policy")
@@ -255,20 +228,18 @@ func getHeadscalePolicy(ctx context.Context) (headscalePolicyResponse, error) {
 	return result, nil
 }
 
-func setHeadscalePolicy(ctx context.Context, policy string) (string, error) {
-	var result headscalePolicyResponse
+func setHeadscalePolicy(ctx context.Context, policy string) error {
 	resp, err := resty.New().SetTimeout(downstreamTimeout).R().SetContext(ctx).
 		SetHeaders(headers).
 		SetBody(map[string]string{"policy": policy}).
-		SetResult(&result).
 		Put(url + "/policy")
 	if err != nil {
-		return "", fmt.Errorf("set Headscale policy: %w", err)
+		return restyRequestError("set Headscale policy", err)
 	}
-	if resp.StatusCode() != http.StatusOK {
-		return "", fmt.Errorf("set Headscale policy: status %d: %s", resp.StatusCode(), resp.String())
+	if resp == nil || resp.StatusCode() != http.StatusOK {
+		return restyResponseError("set Headscale policy", resp)
 	}
-	return result.UpdatedAt, nil
+	return nil
 }
 
 func parsePolicyDocument(policy []byte) (*policyDocument, error) {
@@ -304,24 +275,7 @@ func (p *policyDocument) marshal() ([]byte, error) {
 	return encoded, nil
 }
 
-func (p *policyDocument) managedApplicationPorts() (protocolPorts, []userProtocolPorts, error) {
-	tcpIndex, udpIndex, err := p.defaultRuleIndexes()
-	if err != nil {
-		return protocolPorts{}, nil, err
-	}
-	tcp, err := portsFromDestinations(p.ACLs[tcpIndex].Dst, "default TCP")
-	if err != nil {
-		return protocolPorts{}, nil, err
-	}
-	udp, err := portsFromDestinations(p.ACLs[udpIndex].Dst, "default UDP")
-	if err != nil {
-		return protocolPorts{}, nil, err
-	}
-	defaults, err := normalizeProtocolPorts(protocolPorts{TCP: tcp, UDP: udp})
-	if err != nil {
-		return protocolPorts{}, nil, err
-	}
-
+func (p *policyDocument) managedApplicationPorts() ([]userProtocolPorts, error) {
 	byUser := make(map[string]protocolPorts)
 	for _, acl := range p.ACLs {
 		user, proto, managed := managedUserRule(acl)
@@ -330,7 +284,7 @@ func (p *policyDocument) managedApplicationPorts() (protocolPorts, []userProtoco
 		}
 		ports, err := portsFromDestinations(acl.Dst, user+" "+proto)
 		if err != nil {
-			return protocolPorts{}, nil, err
+			return nil, err
 		}
 		entry := byUser[user]
 		if proto == "tcp" {
@@ -344,22 +298,15 @@ func (p *policyDocument) managedApplicationPorts() (protocolPorts, []userProtoco
 	for user, ports := range byUser {
 		normalized, err := normalizeProtocolPorts(ports)
 		if err != nil {
-			return protocolPorts{}, nil, fmt.Errorf("invalid managed ports for user %q: %w", user, err)
+			return nil, fmt.Errorf("invalid managed ports for user %q: %w", user, err)
 		}
 		application = append(application, userProtocolPorts{User: user, protocolPorts: normalized})
 	}
-	application, err = normalizeUserProtocolPorts(application)
-	return defaults, application, err
+	application, err := normalizeUserProtocolPorts(application)
+	return application, err
 }
 
-func (p *policyDocument) setManagedApplicationPorts(defaults protocolPorts, application []userProtocolPorts) error {
-	tcpIndex, udpIndex, err := p.defaultRuleIndexes()
-	if err != nil {
-		return err
-	}
-	p.ACLs[tcpIndex].Dst = []string{"tag:olares:" + strings.Join(defaults.TCP, ",")}
-	p.ACLs[udpIndex].Dst = []string{"tag:olares:" + strings.Join(defaults.UDP, ",")}
-
+func (p *policyDocument) setManagedApplicationPorts(application []userProtocolPorts) {
 	retained := make([]policyACL, 0, len(p.ACLs)+len(application)*2)
 	for _, acl := range p.ACLs {
 		if _, _, managed := managedUserRule(acl); managed {
@@ -376,69 +323,6 @@ func (p *policyDocument) setManagedApplicationPorts(defaults protocolPorts, appl
 		}
 	}
 	p.ACLs = retained
-	return nil
-}
-
-func (p *policyDocument) applicationRulesCanonical(application []userProtocolPorts) bool {
-	expected := make(map[string]string)
-	for _, entry := range application {
-		if len(entry.TCP) > 0 {
-			expected[entry.User+"\x00tcp"] = strings.Join(entry.TCP, ",")
-		}
-		if len(entry.UDP) > 0 {
-			expected[entry.User+"\x00udp"] = strings.Join(entry.UDP, ",")
-		}
-	}
-	actual := make(map[string]string)
-	for _, acl := range p.ACLs {
-		user, proto, managed := managedUserRule(acl)
-		if !managed {
-			continue
-		}
-		key := user + "\x00" + proto
-		if _, duplicate := actual[key]; duplicate {
-			return false
-		}
-		ports, err := portsFromDestinations(acl.Dst, user+" "+proto)
-		if err != nil {
-			return false
-		}
-		actual[key] = strings.Join(ports, ",")
-	}
-	if len(actual) != len(expected) {
-		return false
-	}
-	for key, ports := range expected {
-		if actual[key] != ports {
-			return false
-		}
-	}
-	return true
-}
-
-func (p *policyDocument) defaultRuleIndexes() (int, int, error) {
-	tcpIndex, udpIndex := -1, -1
-	for i, acl := range p.ACLs {
-		if acl.Action != "accept" || len(acl.Src) != 1 || acl.Src[0] != "autogroup:member" || len(acl.Dst) != 1 || !strings.HasPrefix(acl.Dst[0], "tag:olares:") {
-			continue
-		}
-		switch strings.ToLower(acl.Proto) {
-		case "tcp":
-			if tcpIndex != -1 {
-				return -1, -1, errors.New("Headscale policy has multiple managed default TCP service rules")
-			}
-			tcpIndex = i
-		case "udp":
-			if udpIndex != -1 {
-				return -1, -1, errors.New("Headscale policy has multiple managed default UDP service rules")
-			}
-			udpIndex = i
-		}
-	}
-	if tcpIndex == -1 || udpIndex == -1 {
-		return -1, -1, errors.New("Headscale policy is missing the managed default TCP or UDP service rule")
-	}
-	return tcpIndex, udpIndex, nil
 }
 
 func managedUserRule(acl policyACL) (string, string, bool) {
@@ -608,79 +492,4 @@ func portSpecBounds(spec string) (int, int) {
 	}
 	last, _ := strconv.Atoi(parts[1])
 	return first, last
-}
-
-func subtractUserDefaultPorts(entries []userProtocolPorts, defaults protocolPorts) []userProtocolPorts {
-	result := make([]userProtocolPorts, 0, len(entries))
-	for _, entry := range entries {
-		ports := subtractProtocolPorts(entry.protocolPorts, defaults)
-		if len(ports.TCP) == 0 && len(ports.UDP) == 0 {
-			continue
-		}
-		result = append(result, userProtocolPorts{User: entry.User, protocolPorts: ports})
-	}
-	return result
-}
-
-func effectiveUserPorts(defaults protocolPorts, entries []userProtocolPorts) []userProtocolPorts {
-	result := make([]userProtocolPorts, 0, len(entries))
-	for _, entry := range entries {
-		result = append(result, userProtocolPorts{User: entry.User, protocolPorts: mergeProtocolPorts(defaults, entry.protocolPorts)})
-	}
-	return result
-}
-
-func mergeProtocolPorts(left, right protocolPorts) protocolPorts {
-	merged, _ := normalizeProtocolPorts(protocolPorts{
-		TCP: append(append([]string{}, left.TCP...), right.TCP...),
-		UDP: append(append([]string{}, left.UDP...), right.UDP...),
-	})
-	return merged
-}
-
-func subtractProtocolPorts(all, remove protocolPorts) protocolPorts {
-	return protocolPorts{
-		TCP: subtractPorts(all.TCP, remove.TCP),
-		UDP: subtractPorts(all.UDP, remove.UDP),
-	}
-}
-
-func subtractPorts(all, remove []string) []string {
-	removed := make(map[string]struct{}, len(remove))
-	for _, port := range remove {
-		removed[port] = struct{}{}
-	}
-	result := make([]string, 0, len(all))
-	for _, port := range all {
-		if _, ok := removed[port]; !ok {
-			result = append(result, port)
-		}
-	}
-	return result
-}
-
-func cloneProtocolPorts(ports protocolPorts) protocolPorts {
-	return protocolPorts{TCP: append([]string(nil), ports.TCP...), UDP: append([]string(nil), ports.UDP...)}
-}
-
-func protocolPortsEqual(left, right protocolPorts) bool {
-	return strings.Join(left.TCP, ",") == strings.Join(right.TCP, ",") && strings.Join(left.UDP, ",") == strings.Join(right.UDP, ",")
-}
-
-func userProtocolPortsEqual(left, right []userProtocolPorts) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i].User != right[i].User || !protocolPortsEqual(left[i].protocolPorts, right[i].protocolPorts) {
-			return false
-		}
-	}
-	return true
-}
-
-func userProtocolPortsRevision(ports []userProtocolPorts) string {
-	encoded, _ := json.Marshal(ports)
-	digest := sha256.Sum256(encoded)
-	return "sha256:" + hex.EncodeToString(digest[:])
 }
