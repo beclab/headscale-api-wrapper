@@ -27,10 +27,10 @@ type subnetAccessRule struct {
 	Ports    []string `json:"ports"`
 }
 
-// Reject misspelled fields instead of silently treating a combined request as
-// a partial update. Each endpoint replaces only its own configuration.
-func bindSubnetRequest(c *gin.Context, dst any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20))
+// bindJSON rejects misspelled fields and trailing JSON instead of silently
+// accepting a partial or combined request.
+func bindJSON(c *gin.Context, dst any, maxBytes int64) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes))
 	dec.DisallowUnknownFields()
 	err := dec.Decode(dst)
 	if err == nil {
@@ -67,7 +67,7 @@ func saveSubnetDocument(ctx context.Context, p *policyDocument) error {
 	if err != nil {
 		return err
 	}
-	_, err = setHeadscalePolicy(ctx, string(raw))
+	err = setHeadscalePolicy(ctx, string(raw))
 	return err
 }
 
@@ -131,12 +131,7 @@ func getSubnetRoutes(c *gin.Context) {
 		writeSubnetRouterError(c, &policyShapeError{err: err})
 		return
 	}
-	file, err := readSubnetRoutesFile()
-	if err != nil {
-		writeSubnetRouterError(c, err)
-		return
-	}
-	c.JSON(200, response{Data: gin.H{"routes": routes, "inSync": stringSlicesEqual(routes, file)}})
+	c.JSON(200, response{Data: gin.H{"routes": routes}})
 }
 
 func putSubnetRoutes(c *gin.Context) {
@@ -145,7 +140,7 @@ func putSubnetRoutes(c *gin.Context) {
 	var req struct {
 		Routes *[]string `json:"routes"`
 	}
-	if !bindSubnetRequest(c, &req) {
+	if !bindJSON(c, &req, 1<<20) {
 		return
 	}
 	if req.Routes == nil {
@@ -187,7 +182,8 @@ func putSubnetRoutes(c *gin.Context) {
 		writeSubnetRouterError(c, fmt.Errorf("policy saved but route file sync failed; retry PUT: %w", err))
 		return
 	}
-	c.JSON(200, response{Data: gin.H{"routes": routes, "inSync": true, "changed": changed || fileChanged}})
+	c.JSON(200, response{Data: gin.H{}})
+	logMutation(c, "subnet-routes.put", changed || fileChanged, fmt.Sprintf("routes=%d", len(routes)))
 }
 
 func normalizeSubnetAccess(rules []subnetAccessRule, checkCluster bool) ([]subnetAccessRule, error) {
@@ -431,7 +427,7 @@ func putSubnetAccess(c *gin.Context) {
 	var req struct {
 		Access *[]subnetAccessRule `json:"access"`
 	}
-	if !bindSubnetRequest(c, &req) {
+	if !bindJSON(c, &req, 1<<20) {
 		return
 	}
 	if req.Access == nil {
@@ -461,7 +457,7 @@ func putSubnetAccess(c *gin.Context) {
 	allUsers := []string{}
 	groups, err := p.policyGroups()
 	if err != nil {
-		writeSubnetRouterError(c, err)
+		writeSubnetRouterError(c, &policyShapeError{err: err})
 		return
 	}
 	for _, r := range rules {
@@ -507,5 +503,6 @@ func putSubnetAccess(c *gin.Context) {
 			return
 		}
 	}
-	c.JSON(200, response{Data: gin.H{"access": rules, "changed": changed}})
+	c.JSON(200, response{Data: gin.H{}})
+	logMutation(c, "subnet-access.put", changed, fmt.Sprintf("rules=%d", len(rules)))
 }

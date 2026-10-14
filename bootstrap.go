@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"regexp"
 	"time"
@@ -66,8 +67,10 @@ func createBootstrapAuthKey(c *gin.Context) {
 		err = errors.New("Headscale returned an invalid bootstrap key")
 	}
 	if err != nil {
+		log.Printf("bootstrap authkey failed error=%v", err)
 		c.JSON(http.StatusBadGateway, response{Code: requestHeadscaleError, Message: err.Error()})
 		return
 	}
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(result.Key.Key))
+	log.Printf("bootstrap authkey issued serviceAccount=%q", bootstrapServiceAccount)
 }

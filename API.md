@@ -1,44 +1,114 @@
-# Headscale API Wrapper Specification
+# Headscale API Wrapper 对接说明
 
-This document describes the APIs exposed by `headscale-api-wrapper` to other Olares components. Here, "external" means callers outside the wrapper process. These APIs must remain internal to the cluster through Kubernetes Services and NetworkPolicies and must not be exposed directly to the public internet.
+本文只描述业务调用方需要使用的接口。按“认证 → 请求 → 响应 → 约束”实现即可。
 
-This specification describes the current working-tree implementation, including
-the Olares user and LAN group endpoints. It does not imply that an already
-deployed image supports them. All JSON request bodies use `Content-Type:
-application/json`. Response examples below use the common envelope unless
-explicitly described as the contents of `data`.
+## 目录
 
-## 1. API categories
+- [1. 调用前先确认](#1-调用前先确认)
+  - [1.1 地址与认证](#11-地址与认证)
+  - [1.2 统一响应与错误](#12-统一响应与错误)
+- [2. app-service 专用接口](#2-app-service-专用接口)
+  - [2.1 地址](#21-地址)
+  - [2.2 读取应用端口规则](#22-读取应用端口规则)
+  - [2.3 替换应用端口规则](#23-替换应用端口规则)
+  - [2.4 请求约束](#24-请求约束)
+- [3. 用户注册 key（Vault / LarePass）](#3-用户注册-keyvault--larepass)
+- [4. 设备接口（当前用户自己的设备）](#4-设备接口当前用户自己的设备)
+- [5. 同用户设备互访](#5-同用户设备互访)
+- [6. Exit node 授权（owner）](#6-exit-node-授权owner)
+- [7. 子网路由与内网访问（owner）](#7-子网路由与内网访问owner)
+  - [7.1 发布网段](#71-发布网段)
+  - [7.2 内网访问 ACL](#72-内网访问-acl)
+- [8. Olares 用户与 LAN 组（owner）](#8-olares-用户与-lan-组owner)
+  - [查询可授权用户](#查询可授权用户)
+  - [LAN 组](#lan-组)
 
-| Category | Caller | Port | Path prefix | Credential |
-| --- | --- | --- | --- | --- |
-| Auth key | Vault/LarePass call chain | `9000` | `/headscale` | Olares AccessToken |
-| User device management | Settings and user-service | `8000` | `/headscale` | Olares AccessToken |
-| Olares user listing | Settings owner | `8000` | `/headscale/olares-users` | Owner AccessToken |
-| Reusable LAN groups | Settings owner | `8000` | `/headscale/policy/lan-groups` | Owner AccessToken |
-| Exit-node access management | Settings owner | `8000` | `/headscale/policy/exit-users` | Olares AccessToken |
-| Subnet-router management | Settings owner | `8000` | `/headscale/policy/subnet-router/routes`, `/headscale/policy/subnet-router/access` | Olares AccessToken |
-| Platform policy management | app-service | `8000` | `/internal/policy` | Kubernetes ServiceAccount token |
-| Self-device access | Authenticated Olares user | `8000` | `/headscale/policy/self-mesh` | Olares AccessToken |
-| Shared Tailscale enrollment | Internal Tailscale | `8000` | `/bootstrap/tailscale-authkey` | Dedicated Kubernetes ServiceAccount token |
+## 1. 调用前先确认
 
-Recommended in-cluster addresses:
+### 1.1 地址与认证
 
-- Auth key: `http://headscale-authkey-svc.os-network:9000`
-- User device and platform policy APIs: `http://headscale-server-svc.os-network:8000`
+`/headscale/*` 业务接口：
 
-## 2. Common response format
+- 直连地址：`http://headscale-server-svc.os-network:8000`
+- 经 Olares provider 调用：使用当前用户对应的 provider 入口
+- 用户身份：`X-Authorization: Bearer <Olares AccessToken>`
+- 经 provider 调用时还要带：`Authorization: Bearer <provider ServiceAccount token>`
 
-Headscale HTTP calls have a 10-second timeout. After authentication, policy
-handlers have a shared 30-second operation budget covering lock acquisition
-and downstream calls, including batch user lookups. Client cancellation also
-cancels lock waits and those calls. Lock-wait timeout returns HTTP 504;
-downstream failures retain the endpoint's error response. A write timeout does
-not prove that Headscale rejected the write: read the current state before
-retrying. This is an HTTP-operation budget, not a hard timeout for local disk I/O.
+两个 token 用途不同：`Authorization` 通过 provider 权限检查，`X-Authorization` 由 wrapper 校验当前用户身份。请求体为 JSON 时带 `Content-Type: application/json`。
 
-All wrapper APIs use the following response envelope, except successful bootstrap
-key issuance, which returns plain text (section 4.2):
+第 6～8 节接口只允许 Olares owner 调用；设备接口和 self-mesh 由当前用户操作。
+
+### 1.2 统一响应与错误
+
+成功响应：
+
+```json
+{"code":0,"message":"","data":{}}
+```
+
+常见 HTTP 状态：
+
+- `200`：成功；同时要求 `code == 0`
+- `400`：请求体、用户名、网段或端口格式错误
+- `401`：缺少或无效的用户 AccessToken
+- `403`：当前用户无权操作
+- `409`：托管策略结构不支持当前修改，或要删除的组仍被策略引用（主要出现在 policy/subnet/LAN group 接口）
+- `500`：wrapper 内部处理失败；设备、preauthkey 和 application-ports 的部分上游错误也会返回此状态
+- `502`：owner 校验、Headscale、Kubernetes 或其他上游调用失败（不同接口的映射略有差异）
+- `504`：带策略操作超时控制的请求超过 30 秒
+- 未注册路径可能返回纯文本 `404`
+
+策略写入超时后不要直接重复提交；先 GET 当前状态，再决定是否重试。
+
+## 2. app-service 专用接口
+
+这些接口只供 app-service 等后台服务调用，不供用户或前端直接调用。
+
+### 2.1 地址
+
+```text
+http://headscale-server-svc.os-network:8001
+```
+
+### 2.2 读取应用端口规则
+
+```http
+GET /internal/policy/application-ports
+```
+
+响应：
+
+```json
+{
+  "code": 0,
+  "message": "",
+  "data": {
+    "applicationPorts": [
+      {"user":"alice","tcp":["5000"],"udp":["5353"]}
+    ]
+  }
+}
+```
+
+### 2.3 替换应用端口规则
+
+```http
+PUT /internal/policy/application-ports
+Content-Type: application/json
+```
+
+请求体：
+
+```json
+{
+  "applicationPorts": [
+    {"user":"alice","tcp":["5000","6000-6010"],"udp":["5353"]},
+    {"user":"bob","tcp":[],"udp":["5353"]}
+  ]
+}
+```
+
+成功响应：
 
 ```json
 {
@@ -48,64 +118,28 @@ key issuance, which returns plain text (section 4.2):
 }
 ```
 
-- `code = 0`: success.
-- `code = 1001`: request, authentication, or Headscale call failure.
-- Callers must check both the HTTP status and `code`.
+### 2.4 请求约束
 
-Common HTTP status codes:
+- `applicationPorts` 必须是数组；省略或 `null` 返回 `400`
+- `user` 是策略用户名，不带 `@`
+- `tcp`、`udp` 使用单端口或闭区间，范围 `1–65535`
+- 不允许 `"*"`
+- PUT 是动态应用端口规则的全量替换；未提交用户的动态端口授权会被移除
+- 空数组会清空全部动态应用端口规则
 
-- `200`: success.
-- `400`: invalid request body or port format.
-- `401`: missing or invalid AccessToken or ServiceAccount token.
-- `403`: the node does not belong to the current user, the user is not the Olares owner, or the ServiceAccount is not authorized.
-- `409`: the current policy structure cannot be modified safely.
-- `500`: the wrapper failed to read or parse state.
-- `502`: a Headscale API call failed.
 
-Status codes are not uniform across all handlers: device/preauthkey upstream
-failures can return `500`; subnet route/file failures return `502`; target
-Olares user lookup failures (including Kubernetes errors) currently return
-`400` during authorization writes. Owner lookup failures and user-list lookup
-failures return `502`. A referenced LAN group cannot be deleted (`409`).
-Unregistered paths use Gin's default `404`, which is not the JSON envelope.
+## 3. 用户注册 key（Vault / LarePass）
 
-## 3. Olares user authentication
-
-All `/headscale/*` requests, including owner management requests, must include:
+### 获取当前用户的 preauthkey
 
 ```http
-X-Authorization: Bearer <olares-access-token>
+GET http://headscale-authkey-svc.os-network:9000/headscale/preauthkey
+X-Authorization: Bearer <Olares AccessToken>
 ```
 
-The wrapper sends the AccessToken to the LLDAP token verification endpoint and uses the returned `username` as the Headscale username.
+无请求体、无用户名参数。服务端根据 AccessToken 确定当前用户。
 
-`X-BFL-USER` is used only for diagnostics. It does not select the Headscale user and cannot override the username in the AccessToken.
-
-Owner endpoints additionally require the authenticated Olares User annotation
-`bytetrade.io/owner-role: owner`; `admin` is not sufficient. Credentials checked
-by an intermediate system-server/provider are separate from this wrapper's
-`X-Authorization` header. Do not substitute a ServiceAccount token for the
-Olares AccessToken on these endpoints.
-
-## 4. Auth key API
-
-### 4.1 Get a pre-auth key
-
-```http
-GET /headscale/preauthkey
-```
-
-Port: `9000`
-
-Behavior:
-
-1. Verify the Olares AccessToken.
-2. Find the Headscale user with the same name, creating it if it does not exist.
-3. Create a reusable, non-ephemeral pre-auth key that is valid for 24 hours.
-
-Request body: none.
-
-On success, `data` retains the response structure from the Headscale create pre-auth key API. For example:
+响应中的 `data` 透传 Headscale 结果，注册时使用 `data.preAuthKey.key`：
 
 ```json
 {
@@ -113,523 +147,228 @@ On success, `data` retains the response structure from the Headscale create pre-
   "message": "",
   "data": {
     "preAuthKey": {
-      "id": "21",
       "key": "hskey-auth-...",
       "reusable": true,
-      "ephemeral": false,
-      "expiration": "2026-09-25T10:00:00Z",
-      "user": {
-        "name": "alice"
-      }
+      "expiration": "2026-10-15T10:00:00Z",
+      "user": {"name": "alice"}
     }
   }
 }
 ```
 
-### 4.2 Issue an internal Tailscale bootstrap key
+每次请求都会生成新的 key；有效期以响应中的 `expiration` 为准。
+
+## 4. 设备接口（当前用户自己的设备）
+
+### 查询设备
 
 ```http
-POST /bootstrap/tailscale-authkey
-Authorization: Bearer <projected-service-account-token>
+GET /headscale/node
 ```
 
-Port: `8000`. In-cluster URL:
-`http://headscale-server-svc.os-network:8000/bootstrap/tailscale-authkey`.
-No request body is required; callers cannot override issuance settings.
+```json
+{"code":0,"message":"","data":{"nodes":[]}}
+```
 
-TokenReview must authenticate exactly
-`system:serviceaccount:os-network:tailscale` with audience `headscale-bootstrap`.
-This endpoint does not use an Olares AccessToken or the app-service policy audience.
+只返回当前 AccessToken 用户的设备。
 
-Each successful request creates a non-reusable, non-ephemeral key, valid for
-5 minutes, with `aclTags: ["tag:olares"]` and no ordinary user association.
-HTTP 200 returns the key directly as `text/plain; charset=utf-8`, without a JSON
-envelope. Responses include `Cache-Control: no-store` and `Pragma: no-cache`.
-Missing/invalid credentials return 401, a different authenticated ServiceAccount
-returns 403, and upstream failures or invalid key responses return 502, using
-the JSON envelope. Headscale response bodies are not included in these errors.
-
-Requests are not deduplicated: retries may create additional short-lived keys.
-No legacy-key expiration or deletion job runs. This endpoint does not change
-the reusable 24-hour user preauthkey API in section 4.1. Callers must not log keys.
-
-## 5. User and owner management APIs
-
-These APIs run on port `8000`. Device operations in sections 5.1–5.3 only
-operate on nodes owned by the authenticated Headscale user. Sections 5.4–5.6
-are owner-only management APIs and may authorize other Olares users.
-
-### 5.1 List nodes owned by the current user
+### 删除设备
 
 ```http
-POST /headscale/node
+DELETE /headscale/node/:nodeID
+```
+
+- `nodeID` 为 Headscale 设备 ID
+- 只能删除当前用户的设备
+- 成功时 `data` 为 Headscale 删除结果
+
+### 修改设备名称
+
+```http
+PATCH /headscale/node/:nodeID
 Content-Type: application/json
+
+{"name":"macbook-pro"}
 ```
 
-Request body:
+`name` 必填且不能为空；请求体只接受 `name` 字段。
 
-```json
-{}
-```
+## 5. 同用户设备互访
 
-The wrapper fetches all nodes from Headscale and returns only nodes whose `node.user.name` matches the authenticated username.
-
-Success `data` contains `{"nodes":[...]}` with Headscale node objects preserved.
-An empty `id` also selects listing; a non-empty `id` selects deletion.
-Delete and rename return the upstream response in `data`, not a `changed` flag.
-
-### 5.2 Delete a node owned by the current user
-
-```http
-POST /headscale/node
-Content-Type: application/json
-```
-
-Request body:
-
-```json
-{
-  "id": "12"
-}
-```
-
-When `id` is present, this endpoint deletes the node instead of listing nodes. The wrapper verifies ownership first and returns `403` for a node owned by another user.
-
-### 5.3 Rename a node owned by the current user
-
-```http
-POST /headscale/node/rename
-Content-Type: application/json
-```
-
-Request body:
-
-```json
-{
-  "id": "12",
-  "name": "macbook-pro"
-}
-```
-
-Both `id` and `name` are required. The wrapper verifies ownership before applying the change.
-
-The user-facing APIs do not support transferring nodes between users or assigning arbitrary tags. This prevents users from bypassing shared-Headscale ACL isolation by changing node ownership or tags.
-
-### 5.4 Manage exit-node users
-
-Only the authenticated Olares owner may manage the users allowed to use the
-Olares exit node. The wrapper verifies the AccessToken username and requires
-the matching Olares User to have `bytetrade.io/owner-role: owner`.
-
-```http
-GET /headscale/policy/exit-users
-PUT /headscale/policy/exit-users/:username
-DELETE /headscale/policy/exit-users/:username
-```
-
-- `GET` lists the authorized Olares usernames.
-- `PUT` grants exit-node access and always ensures that the matching Headscale
-  user exists, including when the policy membership is already unchanged.
-- `DELETE` revokes exit-node access.
-- `:username` is the Olares username without the trailing `@` used by
-  Headscale policy aliases.
-- Repeating the same grant or revoke is a successful no-op. `changed` is
-  omitted when false because this response field uses `omitempty`.
-
-PUT and DELETE take no request body. Success `data` contains `users`,
-`revision`, optional `updatedAt`, and `changed: true` only when membership
-changed. `revision` is a digest, not an optimistic-concurrency token.
-
-The wrapper changes only `groups["group:exit-users"]`. It refuses the update
-if the managed group or its single canonical `autogroup:internet:*` ACL rule is
-missing or ambiguous. Headscale validates, stores, and reloads the updated
-database policy immediately; no pod restart is required.
-
-### 5.5 Subnet routes and access (owner only)
-
-These are independent GET/PUT endpoints. Both use the authenticated Olares
-owner's AccessToken; PUT replaces only the addressed resource. Unknown request
-fields, missing arrays and null arrays are rejected.
-
-```http
-GET /headscale/policy/subnet-router/routes
-PUT /headscale/policy/subnet-router/routes
-```
-
-```json
-{"routes":["192.168.1.0/24"]}
-```
-
-Routes must be non-overlapping RFC1918 IPv4 prefixes. Cluster ranges from
-`OLARES_CLUSTER_CIDRS` are forbidden. Non-empty updates fail closed if that
-configuration is missing or invalid; `{"routes":[]}` still clears routes.
-Exact `tag:olares` auto-approval entries are managed by this API, except the
-`10.255.255.254/32` compatibility marker. Other approvers and exit-node
-approval remain unchanged. Conflicting unmanaged entries are rejected.
-
-The policy is saved before the shared route file is atomically updated.
-If the file update fails, retry the same PUT to repair it. GET and PUT return
-`routes` and `inSync`; PUT also returns `changed`. **inSync only compares
-policy and route file, not live advertisement, approval or client connectivity.**
-Saving or clearing routes never changes access rules.
-
-Example PUT success:
-
-```json
-{"code":0,"message":"","data":{"routes":["192.168.1.0/24"],"inSync":true,"changed":true}}
-```
-
-GET returns the same `data` without `changed`. PUT replaces all routes managed
-by this endpoint, not just routes for one user. Publication by Tailscale is
-asynchronous; this response does not wait for advertisement or client updates.
-
-```http
-GET /headscale/policy/subnet-router/access
-PUT /headscale/policy/subnet-router/access
-```
-
-```json
-{
-  "access": [
-    {
-      "users": ["alice"],
-      "target": "192.168.1.10/32",
-      "protocol": "tcp",
-      "ports": ["445", "5000-5010"]
-    },
-    {
-      "users": ["bob"],
-      "target": "192.168.1.20",
-      "protocol": "tcp",
-      "ports": ["22"]
-    }
-  ]
-}
-```
-
-Each rule accepts `users` and optional `groups` (LAN group names without a
-prefix). At least one user or group is required. Users and groups are ORed,
-not intersected. For example:
-
-```json
-{"access":[{"users":["alice"],"groups":["nas-users"],"target":"192.168.31.10/32","protocol":"tcp","ports":["445"]}]}
-```
-
-Targets accept private IPv4 addresses or CIDRs,
-not hosts aliases; cluster overlap is rejected independently of configured
-routes. Protocol is TCP or UDP. Ports support 1–65535, inclusive ranges, or
-a sole `"*"`. `users` may be empty or omitted when `groups` is non-empty;
-both sources empty is invalid. Ports must be non-empty. Limits: 256 rules and 256 port
-entries per rule; request bodies are limited to 1 MiB.
-
-Access may be saved before routes exist. GET returns `access`; PUT also returns
-`changed`. Saving access never reads/writes the route file or changes approvers.
-`{"access":[]}` revokes managed subnet access only.
-
-Referenced groups must already exist. Group names are supplied as `nas-users`,
-not `group:nas-users` or `group:lan-nas-users`; the latter is the generated
-policy key. Group-only rules are supported:
-
-```json
-{"access":[{"users":[],"groups":["nas-users"],"target":"192.168.31.10/32","protocol":"udp","ports":["53"]}]}
-```
-
-PUT returns `data: {"access":[...],"changed":true}`; GET omits `changed`.
-Rules, users, groups and ports may be normalized/reordered. Bare IPv4 targets
-become `/32`; empty `groups` is omitted from responses. There is no per-rule
-DELETE or stable rule ID: read the list, edit it, then PUT the complete list.
-Saving does not alter reusable group membership or exit-node membership.
-
-New managed ACLs carry `"#managed-by": "olares-subnet-access"`; no per-rule
-marker group is created. Sources are direct user aliases and reusable
-`group:lan-<name>` references. Legacy `group:subnet-access-*` rules remain
-readable and are rewritten on access PUT; obsolete marker groups are removed
-only when no policy section references them. The ownership field is not a
-stable rule ID. The legacy
-`group:subnet-users` broad ACL is readable and is replaced on the next access
-PUT. Legacy GET may return an empty protocol (old all-protocol semantics);
-choose TCP/UDP explicitly when replacing it. Other policy rules are preserved
-and remain additive. Olares host LAN addresses are not automatically excluded:
-authorizing them can also permit host services on the specified ports.
-
-The previous combined `/policy/subnet-router` endpoint is removed. Callers and
-the Olares provider ClusterRole must permit both new paths for GET/PUT.
-No revision-based optimistic concurrency is implemented; saves of the same
-resource are last-write-wins. Wrapper writes share the existing policy mutex;
-multiple wrapper replicas or external policy writers require coordination.
-
-### 5.6 Olares users and reusable LAN groups (owner only)
-
-```http
-GET /headscale/olares-users
-GET /headscale/policy/lan-groups
-PUT /headscale/policy/lan-groups/:name
-DELETE /headscale/policy/lan-groups/:name
-```
-
-All endpoints require an authenticated owner. User listing returns
-`data.users: [{"username":"alice"}]` from Olares User CRs, including users
-without Headscale accounts; it never returns User CR annotations or tokens.
-Results are sorted by username; there are no client pagination parameters.
-The wrapper collects Kubernetes pages internally. Nickname, email, role and
-VPN registration status are not returned by this endpoint.
-The wrapper ServiceAccount needs `get` and `list` on
-`users.iam.kubesphere.io`. The deployment/provider permissions must allow
-these new paths and methods; this repository change does not update those
-deployment resources.
-
-Group PUT uses `{"users":["alice","bob"]}` and creates or replaces that group's
-members. An empty array revokes membership but retains the group. Names are
-1–40 lowercase letters, digits or hyphens, starting with a letter. The reserved
-policy namespace is `group:lan-<name>`. GET returns
-`data.groups: [{"name":"nas-users","users":["alice","bob"]}]`.
-Groups can be referenced by multiple access rules. Group deletion returns 409
-while the group is referenced anywhere in the policy. Group changes, access
-changes and other policy writers share the process-wide policy mutex.
-
-Example creation/update:
-
-```http
-PUT /headscale/policy/lan-groups/nas-users
-Content-Type: application/json
-```
-
-```json
-{"users":["alice","bob"]}
-```
-
-Success:
-
-```json
-{"code":0,"message":"","data":{"name":"nas-users","users":["alice","bob"],"changed":true}}
-```
-
-Members are trimmed, deduplicated and sorted. Group PUT rejects unknown fields,
-missing/null `users`, and bodies exceeding 1 MiB. Members are Olares usernames,
-not Headscale IDs or policy aliases; nested groups are not supported. This API
-does not rename groups. GET lists all `group:lan-*` groups, not exit-node or
-internal marker groups.
-
-DELETE takes no body and returns `data: {"changed":true}`. An absent,
-unreferenced group returns `changed: false`. Deletion does not cascade to
-rules; remove references first. Updating members affects every referencing
-rule without requiring a separate access-rule save.
-
-Exit grants, LAN group membership writes and subnet access saves validate
-target usernames against Olares before granting access. Missing Olares users
-and lookup failures reject the update. Existing Olares users may have their
-Headscale identities created on demand. Revoking exit access and clearing
-rules remain possible for deleted users. No automatic user-deletion cleanup
-or stable-user-ID migration is introduced here. Application port policy remains
-an internal, globally replacing API.
-
-### 5.7 Same-user device access
+### 查询或修改当前用户开关
 
 ```http
 GET /headscale/policy/self-mesh
 PUT /headscale/policy/self-mesh
 ```
 
-Any authenticated Olares user may read or change their own setting; owner
-privileges are not required. The username comes only from the AccessToken.
-
-PUT body:
+PUT 请求：
 
 ```json
 {"enabled":true}
 ```
 
-The body must contain only a boolean `enabled`; missing/null values, unknown
-fields, trailing JSON and bodies larger than 4096 bytes are rejected with 400.
-Use `false` to disable access. GET has no request body.
-
-Success example:
+响应：
 
 ```json
 {"code":0,"message":"","data":{"enabled":true,"changed":true}}
 ```
 
-GET and unchanged PUT return `changed: false`. The wrapper changes only the
-current user's membership in `group:self-mesh`; enabling creates the matching
-Headscale user if needed. Other users' memberships remain unchanged. The
-preinstalled canonical ACL must accept `group:self-mesh` to
-`autogroup:self:*` with no protocol restriction, and the group must exist.
-Missing, customized or duplicate managed rules produce 409 rather than being
-silently replaced. Policy updates take effect without a Headscale restart.
-This grants network access between the user's devices, not access to the
-tagged shared Olares node, and does not implement client file-transfer features.
+约束：
 
-## 6. Platform policy management APIs
+- 不传用户名，只操作当前 AccessToken 用户
+- `enabled` 必须是 boolean
+- `false` 表示关闭
+- 重复保存同一值时 `changed` 可能省略
 
-These APIs are intended only for app-service and run on port `8000`.
-
-Requests must include the app-service Kubernetes ServiceAccount token:
+## 6. Exit node 授权（owner）
 
 ```http
-Authorization: Bearer <service-account-token>
+GET    /headscale/policy/exit-users
+PUT    /headscale/policy/exit-users/:username
+DELETE /headscale/policy/exit-users/:username
 ```
 
-The wrapper verifies the token through Kubernetes TokenReview and requires this identity by default:
+PUT、DELETE 无请求体，`:username` 使用 Olares 用户名，不带 `@`。
 
-```text
-system:serviceaccount:os-framework:os-internal
+GET 示例：
+
+```json
+{"code":0,"message":"","data":{"users":["alice","bob"]}}
 ```
 
-The caller must use a projected ServiceAccount token with the dedicated `headscale-policy` audience. The wrapper sends the same audience in the TokenReview request, so the normal Kubernetes API token is rejected.
+PUT/DELETE 示例：
 
-The expected namespace and ServiceAccount can be overridden with:
+```json
+{"code":0,"message":"","data":{"users":["alice"],"changed":true}}
+```
 
-- `POLICY_CLIENT_NAMESPACE`
-- `POLICY_CLIENT_SERVICE_ACCOUNT`
-- `POLICY_TOKEN_AUDIENCE`
+- PUT 授权一个用户，DELETE 撤销一个用户
+- 重复授权或删除不存在的授权是成功的无变化操作，`changed` 可能省略
+- 授权 exit node 不等于授权 subnet router
 
-### 6.1 Read the application port policy
+## 7. 子网路由与内网访问（owner）
+
+发布路由和访问权限是两个独立配置：发布路由只决定客户端是否能得到到该网段的路由；访问权限决定哪些用户/组、哪些协议和端口可以通过 ACL 访问。两者都满足时，流量才可用。
+
+### 7.1 发布网段
 
 ```http
-GET /internal/policy/application-ports
+GET /headscale/policy/subnet-router/routes
+PUT /headscale/policy/subnet-router/routes
 ```
 
-Example response:
+PUT 请求：
+
+```json
+{"routes":["192.168.31.0/24"]}
+```
+
+PUT 响应：
+
+```json
+{"code":0,"message":"","data":{}}
+```
+
+约束：
+
+- `routes` 必须是数组；PUT 是全量替换，不是追加
+- `routes: []` 清空业务发布网段
+- 只接受 IPv4 CIDR；本次提交的网段之间不能重叠
+- 不能覆盖 Olares 集群 Pod/Service 网段
+
+### 7.2 内网访问 ACL
+
+```http
+GET /headscale/policy/subnet-router/access
+PUT /headscale/policy/subnet-router/access
+```
+
+PUT 请求示例：
 
 ```json
 {
-  "code": 0,
-  "message": "",
-  "data": {
-    "defaultPorts": {
-      "tcp": ["53", "80", "443", "18088"],
-      "udp": ["53"]
-    },
-    "applicationPorts": [
-      {
-        "user": "alice",
-        "tcp": ["445", "5000"],
-        "udp": ["5353"]
-      }
-    ],
-    "effectivePorts": [
-      {
-        "user": "alice",
-        "tcp": ["53", "80", "443", "5000", "18088"],
-        "udp": ["53", "5353"]
-      }
-    ],
-    "revision": "sha256:...",
-    "updatedAt": "2026-09-24T10:00:00Z",
-    "inSync": true
-  }
-}
-```
-
-Field definitions:
-
-- `defaultPorts`: platform ports available to every Headscale member.
-- `applicationPorts`: dynamic ports declared by Applications and aggregated by Olares user.
-- `effectivePorts`: the union of default and dynamic ports for users with dynamic entries. Users not present in this array still receive `defaultPorts`.
-- `revision`: a digest of normalized `applicationPorts`.
-- `updatedAt`: the last Headscale policy update time.
-- `inSync`: whether the default and dynamic rules in the database match the wrapper's canonical structure.
-
-### 6.2 Replace the application port policy
-
-```http
-PUT /internal/policy/application-ports
-Content-Type: application/json
-```
-
-Request body:
-
-```json
-{
-  "applicationPorts": [
+  "access": [
     {
-      "user": "alice",
-      "tcp": ["445", "5000", "6000-6010"],
-      "udp": ["5353"]
+      "users": ["alice", "bob"],
+      "target": "192.168.31.0/24",
+      "protocol": "udp",
+      "ports": ["53"]
     },
     {
-      "user": "bob",
-      "tcp": ["8080"],
-      "udp": []
+      "groups": ["nas-users"],
+      "target": "192.168.31.10/32",
+      "protocol": "tcp",
+      "ports": ["445", "5000-5010"]
     }
   ]
 }
 ```
 
-Update semantics:
+字段规则：
 
-- This is a full replacement, not an incremental patch.
-- Replacement is global across users; there is currently no per-user PUT.
-- Dynamic application ports for users omitted from the request are removed.
-- `applicationPorts: []` removes all dynamic application ports while preserving platform default ports.
-- Duplicate entries for the same user are merged and deduplicated.
-- Platform default ports are removed from dynamic entries even if the request includes them.
-- The wrapper ensures that a matching Headscale user exists before writing the policy.
-- If the content is unchanged and the existing rules are canonical, the wrapper does not write to Headscale again.
+- `users` 和 `groups` 至少填写一个；两者是“或”关系
+- 用户名不带 `@`
+- `groups` 填 LAN 组名，例如 `nas-users`
+- `target` 是 IPv4 地址或 CIDR
+- `protocol` 只能是 `tcp` 或 `udp`，大小写不敏感
+- `ports` 是非空数组，支持单端口、闭区间和单独的 `"*"`
+- 端口范围为 `1–65535`；`"*"` 必须是该规则唯一的端口项
+- 每次最多 256 条规则，每条最多 256 个端口项，请求体最多 1 MiB
+- routes 和 access 独立保存；实际访问必须同时存在可达路由和匹配的 ACL
 
-Supported port formats:
-
-- Single port: `"443"`
-- Inclusive range: `"6000-6010"`
-- Every numeric port must be within `1..65535`.
-- Wildcard `"*"` is rejected for application ports (unlike subnet access).
-
-The success response has the same structure as GET and also includes:
+响应：
 
 ```json
-{
-  "changed": true
-}
+{"code":0,"message":"","data":{}}
 ```
 
-`changed` indicates whether this request actually updated the Headscale policy.
+- GET 返回当前全部访问规则
+- PUT 全量替换全部访问规则；未提交的旧规则会被删除
+- `{"access":[]}` 清空全部访问权限
+- 没有单条规则 ID，也没有单条 DELETE；删除一条规则时，GET 后移除目标项，再 PUT 全量列表
 
-## 7. Platform default ports
+## 8. Olares 用户与 LAN 组（owner）
 
-The wrapper currently manages these default ports:
+### 查询可授权用户
 
-```text
-TCP: 53, 80, 443, 18088
-UDP: 53
+```http
+GET /headscale/olares-users
 ```
-
-They correspond to this Headscale policy rule:
 
 ```json
-{
-  "action": "accept",
-  "src": ["autogroup:member"],
-  "proto": "tcp",
-  "dst": ["tag:olares:53,80,443,18088"]
-}
+{"code":0,"message":"","data":{"users":[{"username":"alice"}]}}
 ```
 
-Dynamic application rules are generated per user. For example:
+只返回状态为 `Created` 且未删除的 Olares 用户；是否已经注册 VPN 不影响返回。授权参数使用 `username`。
+
+### LAN 组
+
+```http
+GET    /headscale/policy/lan-groups
+PUT    /headscale/policy/lan-groups/:name
+DELETE /headscale/policy/lan-groups/:name
+```
+
+创建或替换成员：
+
+```http
+PUT /headscale/policy/lan-groups/nas-users
+Content-Type: application/json
+
+{"users":["alice","bob"]}
+```
+
+响应：
 
 ```json
-{
-  "action": "accept",
-  "src": ["alice@"],
-  "proto": "tcp",
-  "dst": ["tag:olares:445,5000"]
-}
+{"code":0,"message":"","data":{"name":"nas-users","users":["alice","bob"],"changed":true}}
 ```
 
-During a read-modify-write operation, the wrapper preserves unrelated ACLs, groups, tag owners, auto-approvers, and policy fields it does not recognize.
+约束：
 
-## 8. Removed and unsupported APIs
-
-The shared Headscale architecture no longer exposes these legacy capabilities:
-
-- `/inner/*` forwarding endpoints.
-- Reading the Headscale control URL.
-- Registering nodes through the management API.
-- Transferring a node to another Headscale user.
-- Assigning arbitrary tags to a node through a user-facing API.
-- The old combined `/headscale/policy/subnet-router` endpoint and the old
-  `/headscale/node/approve_routes` endpoint.
-- Automatic Olares user-deletion cleanup, a cleanup API, or stable-user-ID
-  mapping. Current authorization identities are usernames.
-- A generic policy-editing API or DNS/group-renaming API.
-
-New callers must not depend on these legacy APIs.
+- 组名只能是 1–40 个小写字母、数字或连字符，且以字母开头
+- PUT 替换该组全部成员；`{"users":[]}` 清空成员但保留组
+- 成员必须是可用的 Olares 用户
+- DELETE 不需要请求体；组被访问规则引用时返回 `409`
+- 删除被引用的组前，先从所有 subnet access 规则中移除组引用；不需要先清空成员

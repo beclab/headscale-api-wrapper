@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	neturl "net/url"
@@ -46,6 +45,7 @@ func requireOwnerFor(action string) gin.HandlerFunc {
 		username := c.GetString(authenticatedUserContextKey)
 		owner, err := verifyOlaresOwner(c.Request.Context(), username)
 		if err != nil {
+			logMutationFailure(c, "owner.authorize", err)
 			c.AbortWithStatusJSON(http.StatusBadGateway, response{
 				Code:    requestHeadscaleError,
 				Message: err.Error(),
@@ -53,6 +53,7 @@ func requireOwnerFor(action string) gin.HandlerFunc {
 			return
 		}
 		if !owner {
+			logMutationFailure(c, action, errors.New("authenticated user is not the Olares owner"))
 			c.AbortWithStatusJSON(http.StatusForbidden, response{
 				Code:    requestHeadscaleError,
 				Message: "only the Olares owner may " + action,
@@ -130,8 +131,7 @@ func readOlaresResource(ctx context.Context, suffix string, result any) (bool, e
 		return false, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return false, fmt.Errorf("get Olares user %q: status %d: %s", username, resp.StatusCode, strings.TrimSpace(string(body)))
+		return false, fmt.Errorf("get Olares user %q: status %d", username, resp.StatusCode)
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {

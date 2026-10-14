@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,10 +18,8 @@ const (
 )
 
 type exitUsersState struct {
-	Users     []string `json:"users"`
-	Revision  string   `json:"revision"`
-	UpdatedAt string   `json:"updatedAt,omitempty"`
-	Changed   bool     `json:"changed,omitempty"`
+	Users   []string `json:"users"`
+	Changed bool     `json:"changed,omitempty"`
 }
 
 type policyShapeError struct {
@@ -108,18 +104,17 @@ func updateExitUser(c *gin.Context, grant bool) {
 			c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
 			return
 		}
-		updatedAt, err := setHeadscalePolicy(c.Request.Context(), string(encoded))
+		err = setHeadscalePolicy(c.Request.Context(), string(encoded))
 		if err != nil {
 			c.JSON(http.StatusBadGateway, response{Code: requestHeadscaleError, Message: err.Error()})
 			return
 		}
-		state.UpdatedAt = updatedAt
 	}
 
 	state.Users = users
-	state.Revision = exitUsersRevision(users)
 	state.Changed = changed
 	c.JSON(http.StatusOK, response{Code: 0, Message: "", Data: state})
+	logMutation(c, "exit-user.update", changed, fmt.Sprintf("target=%q grant=%t users=%d", username, grant, len(users)))
 }
 
 func loadExitUsers(ctx context.Context) (exitUsersState, *policyDocument, error) {
@@ -136,9 +131,7 @@ func loadExitUsers(ctx context.Context) (exitUsersState, *policyDocument, error)
 		return exitUsersState{}, nil, &policyShapeError{err: err}
 	}
 	return exitUsersState{
-		Users:     users,
-		Revision:  exitUsersRevision(users),
-		UpdatedAt: policy.UpdatedAt,
+		Users: users,
 	}, document, nil
 }
 
@@ -217,6 +210,9 @@ func (p *policyDocument) policyGroups() (map[string][]string, error) {
 	if err := json.Unmarshal(rawGroups, &groups); err != nil {
 		return nil, fmt.Errorf("decode Headscale policy groups: %w", err)
 	}
+	if groups == nil {
+		return nil, errors.New("Headscale policy groups must be an object")
+	}
 	return groups, nil
 }
 
@@ -273,12 +269,6 @@ func exitUserAliases(users []string) []string {
 		aliases[i] = user + "@"
 	}
 	return aliases
-}
-
-func exitUsersRevision(users []string) string {
-	encoded, _ := json.Marshal(users)
-	digest := sha256.Sum256(encoded)
-	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
 func stringSlicesEqual(left, right []string) bool {
