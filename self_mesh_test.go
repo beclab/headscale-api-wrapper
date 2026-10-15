@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -50,7 +51,7 @@ func TestSelfMeshHTTP(t *testing.T) {
 	defer backend.Close()
 	oldURL, oldVerify := url, verifySessionToken
 	url = backend.URL
-	verifySessionToken = func(token string) (tokenClaims, error) {
+	verifySessionToken = func(ctx context.Context, token string) (tokenClaims, error) {
 		if token != "alice-session" {
 			return tokenClaims{}, fmt.Errorf("invalid session")
 		}
