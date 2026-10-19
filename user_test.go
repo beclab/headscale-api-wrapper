@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestResolveUserIDStringConcurrentCreate(t *testing.T) {
+func TestResolveUserIDStringWithCreateConcurrentCreate(t *testing.T) {
 	var stateMu sync.Mutex
 	created := false
 	successfulCreates := 0
@@ -64,7 +64,7 @@ func TestResolveUserIDStringConcurrentCreate(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			uid, err := resolveUserIDString(context.Background(), "alice")
+			uid, err := resolveUserIDStringWithCreate(context.Background(), "alice", true)
 			if err != nil {
 				errCh <- err
 				return
@@ -84,5 +84,39 @@ func TestResolveUserIDStringConcurrentCreate(t *testing.T) {
 	defer stateMu.Unlock()
 	if successfulCreates != 1 {
 		t.Fatalf("got %d successful creates, want 1", successfulCreates)
+	}
+}
+
+func TestResolveUserIDStringDoesNotCreate(t *testing.T) {
+	created := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/user" {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"users":[]}`))
+		case http.MethodPost:
+			created = true
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	oldURL, oldHeaders := url, headers
+	url, headers = server.URL+"/api/v1", map[string]string{}
+	defer func() {
+		url, headers = oldURL, oldHeaders
+	}()
+
+	if _, err := resolveUserIDString(context.Background(), "alice"); err == nil {
+		t.Fatal("expected missing synchronized user to be rejected")
+	}
+	if created {
+		t.Fatal("ordinary user lookup created a Headscale user")
 	}
 }

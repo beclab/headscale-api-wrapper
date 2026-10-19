@@ -51,3 +51,29 @@ func TestRequireOwner(t *testing.T) {
 		})
 	}
 }
+
+func TestOlaresUserIsAvailableOwner(t *testing.T) {
+	deletionTimestamp := "2026-10-19T00:00:00Z"
+	for _, tt := range []struct {
+		name              string
+		role              string
+		state             string
+		deletionTimestamp *string
+		want              bool
+	}{
+		{name: "available owner", role: "owner", state: "Created", want: true},
+		{name: "non-owner", role: "admin", state: "Created"},
+		{name: "owner not created", role: "owner", state: "Creating"},
+		{name: "deleting owner", role: "owner", state: "Created", deletionTimestamp: &deletionTimestamp},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var user olaresUser
+			user.Metadata.Annotations = map[string]string{ownerRoleAnnotation: tt.role}
+			user.Metadata.DeletionTimestamp = tt.deletionTimestamp
+			user.Status.State = tt.state
+			if got := user.isAvailableOwner(); got != tt.want {
+				t.Fatalf("isAvailableOwner() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}

@@ -20,6 +20,7 @@ import (
 const ownerRoleAnnotation = "bytetrade.io/owner-role"
 
 var verifyOlaresOwner = isOlaresOwner
+var verifyOlaresUserAvailable = isOlaresUserAvailable
 
 type olaresUser struct {
 	Metadata struct {
@@ -34,6 +35,10 @@ type olaresUser struct {
 
 func (u olaresUser) availableForAuthorization() bool {
 	return u.Status.State == "Created" && u.Metadata.DeletionTimestamp == nil
+}
+
+func (u olaresUser) isAvailableOwner() bool {
+	return u.availableForAuthorization() && u.Metadata.Annotations[ownerRoleAnnotation] == "owner"
 }
 
 func requireOwner() gin.HandlerFunc {
@@ -70,7 +75,16 @@ func isOlaresOwner(ctx context.Context, username string) (bool, error) {
 	}
 	var user olaresUser
 	found, err := readOlaresResource(ctx, "/"+neturl.PathEscape(username), &user)
-	return found && user.Metadata.Annotations[ownerRoleAnnotation] == "owner", err
+	return found && user.isAvailableOwner(), err
+}
+
+func isOlaresUserAvailable(ctx context.Context, username string) (bool, error) {
+	if strings.TrimSpace(username) == "" {
+		return false, errors.New("authenticated Olares username is empty")
+	}
+	var user olaresUser
+	found, err := readOlaresResource(ctx, "/"+neturl.PathEscape(username), &user)
+	return found && user.availableForAuthorization(), err
 }
 
 func readOlaresResource(ctx context.Context, suffix string, result any) (bool, error) {
