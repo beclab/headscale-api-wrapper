@@ -6,7 +6,38 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
+
+func TestPreAuthKeyRejectsUnavailableOlaresUser(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalVerifyToken := verifySessionToken
+	originalVerifyAvailable := verifyOlaresUserAvailable
+	t.Cleanup(func() {
+		verifySessionToken = originalVerifyToken
+		verifyOlaresUserAvailable = originalVerifyAvailable
+	})
+	verifySessionToken = func(context.Context, string) (tokenClaims, error) {
+		return tokenClaims{Username: "alice"}, nil
+	}
+	verifyOlaresUserAvailable = func(_ context.Context, username string) (bool, error) {
+		if username != "alice" {
+			t.Fatalf("username = %q, want alice", username)
+		}
+		return false, nil
+	}
+
+	router := gin.New()
+	router.GET("/headscale/preauthkey", getPreAuthKey)
+	request := httptest.NewRequest(http.MethodGet, "/headscale/preauthkey", nil)
+	request.Header.Set("X-Authorization", "Bearer old-token")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusForbidden, response.Body.String())
+	}
+}
 
 func TestAuthenticatedUserUsesVerifiedTokenIdentity(t *testing.T) {
 	original := verifySessionToken

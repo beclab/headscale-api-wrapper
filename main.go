@@ -141,51 +141,19 @@ func requireOwnedNode(c *gin.Context, nodeID string) bool {
 
 func main() {
 	log.SetFlags(log.Lshortfile | log.Ldate | log.Lmicroseconds)
+	// Invalid configuration is fatal, but unavailable dependencies are retried
+	// in the background so user synchronization cannot block the HTTP APIs.
+	// Use Background (not NotifyContext): catching SIGTERM here would stop only
+	// the sync goroutines while gin keeps running and the process may not exit.
+	if err := startHeadscaleUserSync(context.Background()); err != nil {
+		log.Fatalf("configure Headscale user sync: %v", err)
+	}
 
 	{
 		router := gin.Default()
 		router.SetTrustedProxies(nil)
 
-		router.GET(proxyPrefix+preauthkeyStr, func(c *gin.Context) {
-
-			username, err := authenticatedUser(c.Request)
-			if err != nil {
-				c.JSON(http.StatusUnauthorized, response{
-					Code:    requestHeadscaleError,
-					Message: err.Error(),
-				})
-				return
-			}
-
-			uid, err := resolveUserIDString(c.Request.Context(), username)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, response{
-					Code:    requestHeadscaleError,
-					Message: err.Error(),
-				})
-				return
-			}
-			data := createPreAuthKeyRequest{
-				User:       uid,
-				Reusable:   true,
-				Ephemeral:  false,
-				Expiration: time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
-			}
-			resp, err := createPreAuthKey(c.Request.Context(), &data, preauthkeyStr)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, response{
-					Code:    requestHeadscaleError,
-					Message: err.Error(),
-				})
-				return
-			}
-			c.JSON(http.StatusOK, response{
-				Code:    0,
-				Message: "",
-				Data:    resp,
-			})
-			logMutation(c, "preauthkey.create", true, fmt.Sprintf("username=%q", username))
-		})
+		router.GET(proxyPrefix+preauthkeyStr, getPreAuthKey)
 
 		go func() {
 			if err := router.Run(":9000"); err != nil {
@@ -301,8 +269,44 @@ func main() {
 	}
 }
 
+func getPreAuthKey(c *gin.Context) {
+	username, err := authenticatedUser(c.Request)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, response{Code: requestHeadscaleError, Message: err.Error()})
+		return
+	}
+	available, err := verifyOlaresUserAvailable(c.Request.Context(), username)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, response{Code: requestHeadscaleError, Message: err.Error()})
+		return
+	}
+	if !available {
+		c.JSON(http.StatusForbidden, response{Code: requestHeadscaleError, Message: "Olares user is not available"})
+		return
+	}
+
+	uid, err := resolveUserIDString(c.Request.Context(), username)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
+		return
+	}
+	data := createPreAuthKeyRequest{
+		User:       uid,
+		Reusable:   true,
+		Ephemeral:  false,
+		Expiration: time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
+	}
+	resp, err := createPreAuthKey(c.Request.Context(), &data, preauthkeyStr)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, response{Code: requestHeadscaleError, Message: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, response{Code: 0, Message: "", Data: resp})
+	logMutation(c, "preauthkey.create", true, fmt.Sprintf("username=%q", username))
+}
+
 func resolveUserIDString(ctx context.Context, username string) (string, error) {
-	return resolveUserIDStringWithCreate(ctx, username, true)
+	return resolveUserIDStringWithCreate(ctx, username, false)
 }
 
 func resolveUserIDStringWithCreate(ctx context.Context, username string, createIfMissing bool) (string, error) {
@@ -329,7 +333,7 @@ func resolveUserIDStringWithCreate(ctx context.Context, username string, createI
 		}
 	}
 	if !createIfMissing {
-		return "", fmt.Errorf("user %q was created but could not be found", username)
+		return "", fmt.Errorf("Headscale user %q does not exist", username)
 	}
 
 	resp, createErr := resty.New().SetTimeout(downstreamTimeout).R().SetContext(ctx).SetHeaders(headers).
