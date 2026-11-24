@@ -3,18 +3,24 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	neturl "net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 const (
@@ -27,40 +33,116 @@ var replaceSplitDNSZonesFile = replaceFile
 
 var splitDNSLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
 
-// startSplitDNSZoneSync keeps SPLIT_DNS_ZONES_FILE equal to the split DNS zones
-// Headscale must route to the shared node, one per line. It uses the same rules
-// as the render-dns-config initContainer: OLARES_DNS_ZONE (the Pod annotation)
-// wins, otherwise every Olares user's zone annotation is used.
+// splitDNSPublisher serializes user snapshots and periodic disk reconciliation.
+// No output is written until a complete user list has been received.
+type splitDNSPublisher struct {
+	mu           sync.Mutex
+	path, ipPath string
+	zones        []string
+	ready        bool
+}
+
+func (p *splitDNSPublisher) update(zones []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.zones = append([]string(nil), zones...)
+	p.ready = true
+	p.publishLocked()
+}
+
+func (p *splitDNSPublisher) publishLocked() {
+	if p.ready {
+		if err := publishSplitDNSZones(p.path, p.ipPath, p.zones); err != nil {
+			log.Printf("split DNS publish failed; keeping previous configuration: %v", err)
+		}
+	}
+}
+
+func (p *splitDNSPublisher) run(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	watcher, err := fsnotify.NewWatcher()
+	var events <-chan fsnotify.Event
+	var watchErrors <-chan error
+	if err != nil {
+		log.Printf("split DNS watcher unavailable; using periodic reconciliation: %v", err)
+	} else {
+		defer watcher.Close()
+		events, watchErrors = watcher.Events, watcher.Errors
+	}
+	// Watch directories, not inodes: publishers atomically rename files into place.
+	// Retry missing/recreated directories on each reconciliation tick.
+	addWatches := func() {
+		if watcher == nil {
+			return
+		}
+		dirs := map[string]bool{filepath.Dir(p.ipPath): true, filepath.Dir(p.path): true}
+		for dir := range dirs {
+			if err := watcher.Add(dir); err != nil {
+				log.Printf("split DNS watch directory %q: %v; will retry", dir, err)
+			}
+		}
+	}
+	reconcile := func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.publishLocked()
+	}
+	addWatches()
+	// Close the gap between the first user snapshot and installing the watches.
+	reconcile()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-events:
+			if !ok {
+				events = nil
+				continue
+			}
+			name := filepath.Clean(event.Name)
+			if name == filepath.Clean(p.ipPath) || name == filepath.Clean(p.path) {
+				reconcile()
+			}
+		case err, ok := <-watchErrors:
+			if !ok {
+				watchErrors = nil
+				continue
+			}
+			log.Printf("split DNS watch failed: %v; reconciling", err)
+			reconcile()
+		case <-ticker.C:
+			addWatches()
+			reconcile()
+		}
+	}
+}
+
+// startSplitDNSZoneSync publishes Headscale's domain-to-resolvers JSON.
+// User zones are the only domain source; IP changes are reconciled independently.
 func startSplitDNSZoneSync(ctx context.Context) error {
-	path := strings.TrimSpace(os.Getenv("SPLIT_DNS_ZONES_FILE"))
+	path := strings.TrimSpace(os.Getenv("SPLIT_DNS_RESOLVERS_FILE"))
 	if path == "" {
 		return nil
 	}
-	var globalZones []string
-	if global := os.Getenv("OLARES_DNS_ZONE"); global != "" {
-		zones, err := parseGlobalSplitDNSZones(global)
-		if err != nil {
-			return err
-		}
-		globalZones = zones
+	ipPath := strings.TrimSpace(os.Getenv("TAILSCALE_IP_FILE"))
+	if ipPath == "" {
+		ipPath = "/var/lib/headscale/bootstrap/tailscale.ip"
 	}
-
+	if path == ipPath {
+		return errors.New("split DNS output and Tailscale IP input must differ")
+	}
+	publisher := &splitDNSPublisher{path: path, ipPath: ipPath}
+	go publisher.run(ctx, 30*time.Second)
 	go func() {
 		for ctx.Err() == nil {
-			var err error
-			if globalZones != nil {
-				if err = publishSplitDNSZones(path, globalZones); err == nil {
-					return
-				}
-			} else {
-				var api *olaresUserAPI
-				if api, err = newOlaresUserAPI(); err == nil {
-					err = syncSplitDNSZones(ctx, api, path)
-					api.transport.CloseIdleConnections()
-				}
+			api, err := newOlaresUserAPI()
+			if err == nil {
+				err = syncSplitDNSZones(ctx, api, publisher.update)
+				api.transport.CloseIdleConnections()
 			}
 			if err != nil && ctx.Err() == nil {
-				log.Printf("split DNS zone sync failed: %v; retrying in %s", err, splitDNSRetryInterval)
+				log.Printf("split DNS user sync failed: %v; retrying in %s", err, splitDNSRetryInterval)
 			}
 			if !waitForUserSyncRetry(ctx, splitDNSRetryInterval) {
 				return
@@ -74,7 +156,7 @@ func startSplitDNSZoneSync(ctx context.Context) error {
 // events until the watch ends. Each call relists, so events missed between two
 // watches cannot leave the file stale. A failed list returns before writing, so
 // the previous zones stay in place.
-func syncSplitDNSZones(ctx context.Context, api *olaresUserAPI, path string) error {
+func syncSplitDNSZones(ctx context.Context, api *olaresUserAPI, publish func([]string)) error {
 	resp, err := api.get(ctx, "", 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("list Olares users: %w", err)
@@ -104,9 +186,7 @@ func syncSplitDNSZones(ctx context.Context, api *olaresUserAPI, path string) err
 		}
 		zones[user.Metadata.Name] = user.Metadata.Annotations[olaresZoneAnnotation]
 	}
-	if err := publishSplitDNSZones(path, splitDNSZones(zones)); err != nil {
-		return err
-	}
+	publish(splitDNSZones(zones))
 
 	// The client timeout covers the streamed body, so a silently dropped
 	// connection still ends the watch shortly after the server-side timeout.
@@ -135,9 +215,7 @@ func syncSplitDNSZones(ctx context.Context, api *olaresUserAPI, path string) err
 		if err := applyOlaresUserEvent(zones, event.Type, event.Object); err != nil {
 			return err
 		}
-		if err := publishSplitDNSZones(path, splitDNSZones(zones)); err != nil {
-			return err
-		}
+		publish(splitDNSZones(zones))
 	}
 }
 
@@ -189,26 +267,6 @@ func splitDNSZones(zones map[string]string) []string {
 	return result
 }
 
-// parseGlobalSplitDNSZones rejects any invalid entry, like the initContainer,
-// because a partly wrong global zone is a configuration error.
-func parseGlobalSplitDNSZones(value string) ([]string, error) {
-	zones := map[string]string{}
-	for _, item := range strings.Split(value, ",") {
-		zone := strings.ToLower(strings.TrimSpace(item))
-		if zone == "" {
-			continue
-		}
-		if !validSplitDNSZone(zone) {
-			return nil, fmt.Errorf("invalid OLARES_DNS_ZONE entry %q", item)
-		}
-		zones[zone] = zone
-	}
-	if len(zones) == 0 {
-		return nil, errors.New("OLARES_DNS_ZONE has no zones")
-	}
-	return splitDNSZones(zones), nil
-}
-
 func validSplitDNSZone(zone string) bool {
 	if len(zone) > 253 {
 		return false
@@ -225,23 +283,38 @@ func validSplitDNSZone(zone string) bool {
 	return true
 }
 
-// publishSplitDNSZones rewrites the file only when the zone set changed; most
-// user updates (status, avatar, entrance IP) do not touch the zone annotation.
-func publishSplitDNSZones(path string, zones []string) error {
-	var data []byte
+// publishSplitDNSZones compares against disk so missing or stale files heal even
+// without user events. Empty zones explicitly clear routes without needing an IP.
+func publishSplitDNSZones(path, ipPath string, zones []string) error {
+	resolvers := make(map[string][]string, len(zones))
 	if len(zones) > 0 {
-		data = []byte(strings.Join(zones, "\n") + "\n")
+		raw, err := os.ReadFile(ipPath)
+		if err != nil {
+			return fmt.Errorf("read Tailscale IP: %w", err)
+		}
+		addr, err := netip.ParseAddr(strings.TrimSpace(string(raw)))
+		if err != nil || !addr.Is4() || !addr.IsGlobalUnicast() {
+			return errors.New("Tailscale IP file must contain one unicast IPv4 address")
+		}
+		for _, zone := range zones {
+			resolvers[zone] = []string{addr.String()}
+		}
 	}
+	data, err := json.Marshal(resolvers)
+	if err != nil {
+		return fmt.Errorf("encode split DNS resolvers: %w", err)
+	}
+	data = append(data, '\n')
 	current, err := os.ReadFile(path)
 	if err == nil && bytes.Equal(current, data) {
 		return nil
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("read split DNS zones file: %w", err)
+		return fmt.Errorf("read split DNS resolvers file: %w", err)
 	}
 	if err := replaceSplitDNSZonesFile(path, data); err != nil {
-		return fmt.Errorf("write split DNS zones file: %w", err)
+		return fmt.Errorf("write split DNS resolvers file: %w", err)
 	}
-	log.Printf("split DNS zones updated: zones=%q", zones)
+	log.Printf("split DNS resolvers published: zones=%d sha256=%x", len(zones), sha256.Sum256(data))
 	return nil
 }
