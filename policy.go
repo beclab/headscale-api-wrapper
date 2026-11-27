@@ -172,9 +172,8 @@ func putApplicationPorts(c *gin.Context) {
 	}
 	changed := !bytes.Equal(before, after)
 	if changed {
-		// Headscale resolves user aliases while validating the policy. Ensure each
-		// real Olares owner has a corresponding Headscale user before referencing
-		// owner@. User creation alone grants no network access.
+		// Headscale resolves user aliases while validating the policy, so each
+		// owner must already be synchronized from LLDAP before owner@ is referenced.
 		for _, entry := range requested {
 			if _, err := resolveUserIDString(c.Request.Context(), entry.User); err != nil {
 				c.JSON(http.StatusBadGateway, response{Code: requestHeadscaleError, Message: fmt.Sprintf("ensure Headscale user %q: %v", entry.User, err)})

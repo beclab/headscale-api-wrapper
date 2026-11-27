@@ -86,9 +86,8 @@ func updateExitUser(c *gin.Context, grant bool) {
 			c.JSON(http.StatusBadRequest, response{Code: requestHeadscaleError, Message: err.Error()})
 			return
 		}
-		// Headscale validates user aliases during policy updates. Creating the
-		// corresponding user does not grant access by itself. Always ensure it
-		// exists so an idempotent grant also repairs a missing identity record.
+		// Headscale validates user aliases during policy updates, so the user must
+		// already be synchronized from LLDAP.
 		if _, err := resolveUserIDString(c.Request.Context(), username); err != nil {
 			c.JSON(http.StatusBadGateway, response{
 				Code:    requestHeadscaleError,

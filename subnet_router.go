@@ -307,29 +307,34 @@ func writeSubnetRoutesFile(routes []string) (bool, error) {
 	if err == nil && stringSlicesEqual(current, routes) {
 		return false, nil
 	}
-	path := subnetRoutesFile()
-	if err := os.MkdirAll(filepath.Dir(path), 0770); err != nil {
+	if err := replaceFile(subnetRoutesFile(), []byte(strings.Join(routes, ",")+"\n")); err != nil {
 		return false, err
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".subnet-routes-*")
+	return true, nil
+}
+
+// replaceFile writes through a temporary file and a rename so readers never see
+// partial content.
+func replaceFile(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0770); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
 	if err != nil {
-		return false, err
+		return err
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
 	if err := temporary.Chmod(0640); err != nil {
 		temporary.Close()
-		return false, err
+		return err
 	}
-	if _, err := temporary.WriteString(strings.Join(routes, ",") + "\n"); err != nil {
+	if _, err := temporary.Write(data); err != nil {
 		temporary.Close()
-		return false, err
+		return err
 	}
 	if err := temporary.Close(); err != nil {
-		return false, err
+		return err
 	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return false, err
-	}
-	return true, nil
+	return os.Rename(temporaryPath, path)
 }

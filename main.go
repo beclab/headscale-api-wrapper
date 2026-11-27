@@ -148,6 +148,9 @@ func main() {
 	if err := startHeadscaleUserSync(context.Background()); err != nil {
 		log.Fatalf("configure Headscale user sync: %v", err)
 	}
+	if err := startSplitDNSZoneSync(context.Background()); err != nil {
+		log.Fatalf("configure split DNS zone sync: %v", err)
+	}
 
 	{
 		router := gin.Default()
